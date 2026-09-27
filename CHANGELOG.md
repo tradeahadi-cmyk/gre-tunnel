@@ -2,7 +2,7 @@
 
 نصب یک نسخه مشخص (به‌جای آخرین نسخه):
 ```bash
-bash <(curl -sSL https://raw.githubusercontent.com/tradeahadi-cmyk/gre-tunnel/v2.0.1/gre-install.sh)
+bash <(curl -sSL https://raw.githubusercontent.com/tradeahadi-cmyk/gre-tunnel/main/versions/v2.0.1/gre-install.sh)
 ```
 نسخه نصب‌شده روی سرور: `gre-tunnel version`
 
@@ -22,3 +22,4 @@ bash <(curl -sSL https://raw.githubusercontent.com/tradeahadi-cmyk/gre-tunnel/v2
 
 ## v1.0.0 — ۲۷ سپتامبر ۲۰۲۶ (۵ مهر ۱۴۰۵)
 - نسخه اول بر پایه vatanhost/gre: سرویس systemd برای ماندن بعد از ریبوت، واچ‌داگ، MSS clamp، BBR.
+- استفاده نکنید: مشکل‌های امنیتی و ترتیب پورت‌ها که در v2.0.0 رفع شد را دارد.

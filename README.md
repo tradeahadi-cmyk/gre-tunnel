@@ -12,7 +12,10 @@ bash <(curl -sSL https://raw.githubusercontent.com/tradeahadi-cmyk/gre-tunnel/ma
 
 اسکریپت خودش تانل قدیمی `vatan-m2` و قوانینش را پاک می‌کند، حتی اگر در rc.local یا crontab یا rules.v4 ذخیره شده باشد (از فایل‌ها نسخه `.bak` می‌ماند).
 
-نسخه‌ها و تغییرات هر نسخه در [CHANGELOG.md](CHANGELOG.md) است. برای نصب یک نسخه مشخص، به‌جای `main` شماره نسخه را بگذارید (مثلاً `v2.0.1`).
+نسخه‌ها و تغییرات هر نسخه در [CHANGELOG.md](CHANGELOG.md) است. هر نسخه در پوشه `versions/` هم نگه داشته می‌شود؛ برای نصب یک نسخه مشخص (مثلاً اگر نسخه جدید مشکل داشت):
+```bash
+bash <(curl -sSL https://raw.githubusercontent.com/tradeahadi-cmyk/gre-tunnel/main/versions/v2.0.1/gre-install.sh)
+```
 
 ## تست
 ```bash
