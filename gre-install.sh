@@ -2,6 +2,7 @@
 # Optimized GRE tunnel (based on vatanhost/gre): survives reboots, forwards
 # only the ports you choose, MSS clamping, self-repairing watchdog.
 set -u
+GRE_VERSION=2.0.1
 [ "$(id -u)" = 0 ] || { echo "Run as root"; exit 1; }
 if ! command -v ping >/dev/null && command -v apt-get >/dev/null; then
   echo "[*] installing iputils-ping"; apt-get install -y -qq iputils-ping >/dev/null 2>&1
@@ -60,7 +61,9 @@ install_files() {
 # GRE tunnel runtime. Usage: gre-tunnel up|down|check|watchdog <N>
 # Settings for tunnel N live in /etc/gre-tunnel/<N>.conf
 set -u
+VERSION=2.0.1
 CMD=${1:-}; N=${2:-}
+if [ "$CMD" = version ]; then echo "gre-tunnel $VERSION"; exit 0; fi
 CONF=/etc/gre-tunnel/$N.conf
 if [ -z "$N" ] || [ ! -f "$CONF" ]; then echo "usage: gre-tunnel up|down|check|watchdog <N>  (missing $CONF)"; exit 1; fi
 MTU=1420
@@ -201,7 +204,7 @@ watchdog() {
 case "$CMD" in
   up) up ;; down) down ;; watchdog) watchdog ;;
   check) if check; then echo "tunnel $N OK ($PEER_TIP reachable)"; else echo "tunnel $N DOWN ($PEER_TIP not reachable)"; exit 1; fi ;;
-  *) echo "usage: gre-tunnel up|down|check|watchdog <N>"; exit 1 ;;
+  *) echo "usage: gre-tunnel up|down|check|watchdog <N> | version"; exit 1 ;;
 esac
 RUNTIME
   chmod +x /usr/local/sbin/gre-tunnel
@@ -346,7 +349,7 @@ do_status() {
 }
 
 echo "===================================="
-echo "   GRE Tunnel (optimized) Setup v2"
+echo "   GRE Tunnel (optimized) Setup v$GRE_VERSION"
 echo "===================================="
 echo "1 - Install / update tunnel"
 echo "2 - Remove tunnel"
