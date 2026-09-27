@@ -5,7 +5,7 @@
 # Usage: xray-tunnel check|on|off <N> [port]   (up|down|keep|prestart: used by the services)
 # Settings for tunnel N live in /etc/xray-tunnel/<N>.conf
 set -u
-VERSION=3.0.0
+VERSION=3.0.1
 CMD=${1:-}; N=${2:-}; ARG=${3:-}
 DIR=/etc/xray-tunnel
 BIN=/usr/local/lib/xray-tunnel/xray
