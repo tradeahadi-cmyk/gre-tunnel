@@ -14,7 +14,7 @@ bash <(curl -sSL https://raw.githubusercontent.com/tradeahadi-cmyk/gre-tunnel/ma
 
 نسخه‌ها و تغییرات هر نسخه در [CHANGELOG.md](CHANGELOG.md) است. هر نسخه در پوشه `versions/` هم نگه داشته می‌شود؛ برای نصب یک نسخه مشخص (مثلاً اگر نسخه جدید مشکل داشت):
 ```bash
-bash <(curl -sSL https://raw.githubusercontent.com/tradeahadi-cmyk/gre-tunnel/main/versions/v2.3.0/gre-install.sh)
+bash <(curl -sSL https://raw.githubusercontent.com/tradeahadi-cmyk/gre-tunnel/main/versions/v2.4.0/gre-install.sh)
 ```
 
 ## تست
@@ -30,7 +30,12 @@ journalctl -t gre-watchdog         # گزارش‌های واچ‌داگ
 همان دستور نصب و گزینه 5. تنظیمات عوض نمی‌شود و کاربران قطع نمی‌شوند. روی هر سه سرور بزنید.
 
 ## حذف
-همان دستور نصب و گزینه 2.
+- **حذف یک تانل:** همان دستور نصب و گزینه 2.
+- **حذف کامل (گزینه 6):** همه تانل‌های این اسکریپت و هر چیزی را که نصب کرده پاک می‌کند: سرویس‌ها، قوانین فایروال، اینترفیس‌های vgre، فایل‌ها و تنظیمات BBR. سرور به حالت قبل از نصب برمی‌گردد. x-ui، SSH و سرویس‌های دیگر دست نمی‌خورند. کاربرانی که روی تانل‌ها هستند قطع می‌شوند، برای همین باید `yes` تایپ کنید:
+```bash
+printf '6\nyes\n' | bash <(curl -sSL https://raw.githubusercontent.com/tradeahadi-cmyk/gre-tunnel/main/gre-install.sh)
+```
+  `ip_forward` و اندازه جدول conntrack روی سرور ایران تا ریبوت بعدی همان‌طور می‌مانند، چون خاموش کردنشان ممکن است سرویس‌های دیگر را قطع کند. اگر مقدار قبلی BBR معلوم نباشد (نصب با نسخه‌های قبل از 2.4.0)، BBR هم تا ریبوت بعدی می‌ماند. اگر قوانین فایروال در `/etc/iptables/rules.v4` ذخیره شده باشند، قوانین تانل از آنجا هم پاک می‌شوند (نسخه پشتیبان: `rules.v4.gre-bak`). تانل قدیمی vatan برگردانده نمی‌شود.
 
 ## چه چیزی عوض شده (نسبت به اسکریپت vatanhost)
 - بعد از ریبوت خودکار بالا می‌آید (سرویس systemd).
