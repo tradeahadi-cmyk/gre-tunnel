@@ -14,13 +14,14 @@ bash <(curl -sSL https://raw.githubusercontent.com/tradeahadi-cmyk/gre-tunnel/ma
 
 نسخه‌ها و تغییرات هر نسخه در [CHANGELOG.md](CHANGELOG.md) است. هر نسخه در پوشه `versions/` هم نگه داشته می‌شود؛ برای نصب یک نسخه مشخص (مثلاً اگر نسخه جدید مشکل داشت):
 ```bash
-bash <(curl -sSL https://raw.githubusercontent.com/tradeahadi-cmyk/gre-tunnel/main/versions/v2.0.1/gre-install.sh)
+bash <(curl -sSL https://raw.githubusercontent.com/tradeahadi-cmyk/gre-tunnel/main/versions/v2.1.0/gre-install.sh)
 ```
 
 ## تست
 ```bash
 gre-tunnel check 1                 # روی ایران یا خارج
 gre-tunnel version                 # نسخه نصب‌شده
+gre-tunnel diag 1                  # اگر کار نمی‌کند: علت را پیدا می‌کند (روی هر دو سرور)
 systemctl status gre-tunnel@1
 journalctl -t gre-watchdog         # گزارش‌های واچ‌داگ
 ```

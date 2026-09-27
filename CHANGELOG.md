@@ -2,9 +2,14 @@
 
 نصب یک نسخه مشخص (به‌جای آخرین نسخه):
 ```bash
-bash <(curl -sSL https://raw.githubusercontent.com/tradeahadi-cmyk/gre-tunnel/main/versions/v2.0.1/gre-install.sh)
+bash <(curl -sSL https://raw.githubusercontent.com/tradeahadi-cmyk/gre-tunnel/main/versions/v2.1.0/gre-install.sh)
 ```
 نسخه نصب‌شده روی سرور: `gre-tunnel version`
+
+## v2.1.0 — ۲۷ سپتامبر ۲۰۲۶ (۵ مهر ۱۴۰۵)
+- دستور جدید `gre-tunnel diag N` و گزینه ۴ منو (Diagnose): می‌گوید چرا تانل کار نمی‌کند. آی‌پی سرور، مسیر به سرور مقابل (مثلاً اگر WARP مسیر را عوض کرده)، تانل قدیمی vatan، قوانین فایروال، و با tcpdump می‌شمارد چند بسته GRE رفت و چند تا برگشت.
+- رفع باگ: روی سرور خارج، سرور نمی‌توانست آی‌پی خودش را پینگ کند (مثلاً `ping 10.200.1.1` روی خود آلمان). قانون قدیمی خودکار پاک می‌شود.
+- هنگام به‌روزرسانی، تانل با نسخه قبلی متوقف می‌شود تا قوانین قدیمی دقیق پاک شوند.
 
 ## v2.0.1 — ۲۷ سپتامبر ۲۰۲۶ (۵ مهر ۱۴۰۵)
 - شماره نسخه در منوی نصب و دستور `gre-tunnel version`.

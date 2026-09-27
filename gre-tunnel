@@ -1,12 +1,12 @@
 #!/bin/bash
-# GRE tunnel runtime. Usage: gre-tunnel up|down|check|watchdog <N>
+# GRE tunnel runtime. Usage: gre-tunnel up|down|check|diag|watchdog <N>
 # Settings for tunnel N live in /etc/gre-tunnel/<N>.conf
 set -u
-VERSION=2.0.1
+VERSION=2.1.0
 CMD=${1:-}; N=${2:-}
 if [ "$CMD" = version ]; then echo "gre-tunnel $VERSION"; exit 0; fi
 CONF=/etc/gre-tunnel/$N.conf
-if [ -z "$N" ] || [ ! -f "$CONF" ]; then echo "usage: gre-tunnel up|down|check|watchdog <N>  (missing $CONF)"; exit 1; fi
+if [ -z "$N" ] || [ ! -f "$CONF" ]; then echo "usage: gre-tunnel up|down|check|diag|watchdog <N>  (missing $CONF)"; exit 1; fi
 MTU=1420
 # shellcheck source=/dev/null
 . "$CONF"   # ROLE LOCAL_IP REMOTE_IP PORTS SSH_PORTS [MTU]
@@ -71,8 +71,9 @@ rules() { local f=$1 c
         $f filter -I INPUT -i "$IF" -p udp -m multiport --dports "$c" -j ACCEPT
       done < <(chunks "$PORTS")
     fi
-    # hide from ping scans on the public IP (only echo-request; PMTU ICMP still works)
-    $f filter -I INPUT ! -i vgre+ -p icmp --icmp-type echo-request -j DROP
+    # hide from ping scans on the public IP (only echo-request; PMTU ICMP
+    # still works, and the server can still ping its own addresses)
+    $f filter -I INPUT ! -i vgre+ -m addrtype ! --src-type LOCAL -p icmp --icmp-type echo-request -j DROP
   fi
 }
 
@@ -82,6 +83,11 @@ tune_conntrack() {
     echo 262144 > $d/nf_conntrack_max; fi
   if [ -w $d/nf_conntrack_tcp_timeout_established ] && [ "$(cat $d/nf_conntrack_tcp_timeout_established)" -gt 7440 ]; then
     echo 7440 > $d/nf_conntrack_tcp_timeout_established; fi
+}
+
+# rules written by older versions of this script
+legacy_cleanup() {
+  ipt_del filter -I INPUT ! -i vgre+ -p icmp --icmp-type echo-request -j DROP   # v2.0.x
 }
 
 up() {
@@ -102,6 +108,7 @@ up() {
   ip addr replace "$MY_TIP/30" dev "$IF"
   if [ "$ROLE" = iran ]; then sysctl -qw net.ipv4.ip_forward=1; fi
   FAIL=0; rules ipt_add
+  legacy_cleanup
   if [ "$ROLE" = iran ]; then tune_conntrack; fi
   [ "$FAIL" = 0 ] || exit 1
   echo "$IF up: $MY_TIP <-> $PEER_TIP (mtu $MTU)"
@@ -109,9 +116,65 @@ up() {
 
 down() {
   rules ipt_del
+  legacy_cleanup
   ip link del "$IF" 2>/dev/null
   rm -f "/run/gre-watchdog.$N" "/run/gre-watchdog.$N.rx"
   true
+}
+
+# Prints what is wrong with tunnel N, if anything
+diag() {
+  local wan dev src other rx0 tx0 rx1 tx1 cap="" nout=0 nin=0 pr
+  echo "gre-tunnel $VERSION | tunnel $N | role $ROLE | $LOCAL_IP -> $REMOTE_IP | ports $PORTS | mtu $MTU"
+  wan=$(ip -4 -o addr show | awk -v ip="$LOCAL_IP" 'index($4, ip "/") == 1 { print $2; exit }')
+  if [ -n "$wan" ]; then echo "[ok] $LOCAL_IP is on $wan"
+  else echo "[!!] $LOCAL_IP is not on any interface of this server (NAT?). GRE must use the interface address:"
+       ip -4 -o addr show scope global | awk '{ print "     " $2 " " $4 }'; fi
+  read -r dev src < <(ip -4 route get "$REMOTE_IP" 2>/dev/null | awk '{ for (i = 1; i < NF; i++) { if ($i == "dev") d = $(i + 1); if ($i == "src") s = $(i + 1) } } END { print d, s }')
+  if [ -z "$dev" ]; then
+    echo "[!!] no route to $REMOTE_IP"
+  elif [ -n "$wan" ] && [ "$dev" != "$wan" ]; then
+    echo "[!!] packets to $REMOTE_IP leave via $dev, not $wan (WARP or another VPN is routing them). GRE cannot work like this."
+  else echo "[ok] route to $REMOTE_IP via $dev (src $src)"; fi
+  if ip link show "$IF" >/dev/null 2>&1; then echo "[ok] $IF exists (mtu $(cat "/sys/class/net/$IF/mtu"))"
+  else echo "[!!] $IF does not exist: systemctl restart gre-tunnel@$N; journalctl -u gre-tunnel@$N -n 20"; fi
+  other=$(ip tunnel show 2>/dev/null | awk -v me="$IF:" -v r="remote $REMOTE_IP " 'index($0 " ", r) && $1 != me { sub(":", "", $1); print $1 }')
+  [ -n "$other" ] && echo "[!!] another tunnel to $REMOTE_IP exists: $other (old vatan-m2? remove: ip link del $other)"
+  MISSING=0; rules ipt_chk
+  if [ "$MISSING" = 0 ]; then echo "[ok] firewall rules in place"; else echo "[!!] some firewall rules are missing (the watchdog re-adds them within 30s)"; fi
+  if iptables -w -t nat -S PREROUTING 2>/dev/null | grep -- '-j DNAT' | grep -qvE -- '-p (tcp|udp)'; then
+    echo "[!!] a catch-all DNAT rule is in nat PREROUTING (old vatan script?), it also captures GRE:"
+    iptables -w -t nat -S PREROUTING | grep -- '-j DNAT' | grep -vE -- '-p (tcp|udp)' | sed 's/^/     /'; fi
+  rx0=$(cat "/sys/class/net/$IF/statistics/rx_packets" 2>/dev/null || echo 0)
+  tx0=$(cat "/sys/class/net/$IF/statistics/tx_packets" 2>/dev/null || echo 0)
+  if command -v tcpdump >/dev/null && [ -n "$wan" ]; then
+    cap=$(mktemp)
+    timeout 9 tcpdump -lni "$wan" -c 60 "ip proto 47 and host $REMOTE_IP" > "$cap" 2>/dev/null &
+    sleep 1
+  fi
+  if ping -c 4 -W 2 -q "$PEER_TIP" >/dev/null 2>&1; then pr=ok; else pr=FAILED; fi
+  rx1=$(cat "/sys/class/net/$IF/statistics/rx_packets" 2>/dev/null || echo 0)
+  tx1=$(cat "/sys/class/net/$IF/statistics/tx_packets" 2>/dev/null || echo 0)
+  echo "ping $PEER_TIP: $pr ($IF sent $((tx1 - tx0)), received $((rx1 - rx0)) packets)"
+  if [ -n "$cap" ]; then
+    wait
+    nout=$(grep -cF "IP $LOCAL_IP > $REMOTE_IP:" "$cap"); nin=$(grep -cF "IP $REMOTE_IP > $LOCAL_IP:" "$cap"); rm -f "$cap"
+    echo "GRE packets on $wan: $nout sent to $REMOTE_IP, $nin received from $REMOTE_IP"
+  fi
+  echo
+  if [ "$pr" = ok ]; then echo "RESULT: tunnel works."
+  elif [ -z "$cap" ]; then
+    echo "RESULT: tunnel does not answer. For a clearer answer install tcpdump (apt install -y tcpdump) and run diag again, on both servers."
+  elif [ "$nout" -gt 0 ] && [ "$nin" -eq 0 ]; then
+    echo "RESULT: GRE leaves this server but nothing comes back from $REMOTE_IP."
+    echo "        Either the other server is not installed / uses another tunnel number, its firewall drops GRE,"
+    echo "        or GRE is blocked between the two servers. Run 'gre-tunnel diag $N' on $REMOTE_IP too."
+  elif [ "$nin" -gt 0 ]; then
+    echo "RESULT: GRE from $REMOTE_IP arrives, but the ping still fails. Check that both sides use the same"
+    echo "        tunnel number and each other's IPs, and look at the [!!] lines above (on both servers)."
+  else
+    echo "RESULT: no GRE packets were sent. Look at the [!!] lines above."
+  fi
 }
 
 check() { ping -c 3 -W 2 -q "$PEER_TIP" >/dev/null 2>&1; }
@@ -143,7 +206,7 @@ watchdog() {
 }
 
 case "$CMD" in
-  up) up ;; down) down ;; watchdog) watchdog ;;
+  up) up ;; down) down ;; watchdog) watchdog ;; diag) diag ;;
   check) if check; then echo "tunnel $N OK ($PEER_TIP reachable)"; else echo "tunnel $N DOWN ($PEER_TIP not reachable)"; exit 1; fi ;;
-  *) echo "usage: gre-tunnel up|down|check|watchdog <N> | version"; exit 1 ;;
+  *) echo "usage: gre-tunnel up|down|check|diag|watchdog <N> | version"; exit 1 ;;
 esac
