@@ -1,0 +1,291 @@
+#!/bin/bash
+# Encrypted tunnel runtime: VLESS + WebSocket + TLS from Iran to a foreign server,
+# one encrypted connection per user connection. Runs next to the GRE tunnel with
+# the same number; ports are moved onto it and back to GRE only by hand (on/off).
+# Usage: xray-tunnel check|on|off <N> [port]   (up|down|keep|prestart: used by the services)
+# Settings for tunnel N live in /etc/xray-tunnel/<N>.conf
+set -u
+VERSION=3.0.0
+CMD=${1:-}; N=${2:-}; ARG=${3:-}
+DIR=/etc/xray-tunnel
+BIN=/usr/local/lib/xray-tunnel/xray
+if [ "$CMD" = version ]; then echo "xray-tunnel $VERSION"; exit 0; fi
+CONF=$DIR/$N.conf
+if ! [[ $N =~ ^[1-9]$ ]] || [ ! -f "$CONF" ]; then
+  echo "usage: xray-tunnel check|on|off|up|down|keep <N> [port]  (missing $CONF; menu: gre-install)"; exit 1; fi
+# one change at a time: the 30 s timer, on/off and the installer
+case "$CMD" in up|down|keep|on|off|prestart)
+  if command -v flock >/dev/null; then
+    exec 9> "/run/xray-tunnel.$N.lock"; flock -w 30 9 || { echo "tunnel $N is busy, try again"; exit 1; }
+  fi ;;
+esac
+ON=""; PIN=""; LPORTS=""; LHPORT=""; SNI=""; DEST=127.0.0.1
+# shellcheck source=/dev/null
+. "$CONF"   # ROLE REMOTE_IP TPORT UUID WSPATH SNI PORTS HPORT DEST; iran: PIN LPORTS LHPORT ON
+JSON=$DIR/$N.json
+NEWJSON=$DIR/$N.new.json   # xray reads the format from the .json ending
+CHAIN=XTUN$N
+STATE=/run/xray-tunnel.$N
+# copy of the settings the running xray was started with
+RUNNING=/run/xray-tunnel.$N.json
+JUMP=(PREROUTING ! -i vgre+ -m addrtype --dst-type LOCAL -j "$CHAIN")
+TAG=(-m comment --comment "xray-tunnel-$N")
+
+log() { logger -t xray-tunnel "tunnel $N: $*"; }
+ipt_add() { local t=$1 op=$2; shift 2
+  iptables -w -t "$t" -C "$@" 2>/dev/null || iptables -w -t "$t" "$op" "$@"; }
+ipt_del() { local t=$1; shift
+  while iptables -w -t "$t" -C "$@" 2>/dev/null; do iptables -w -t "$t" -D "$@"; done; }
+
+# local listener of a user port, from LPORTS="443=61001,43773=61002"
+lport() { local IFS=, m
+  for m in $LPORTS; do [ "${m%%=*}" = "$1" ] && { echo "${m#*=}"; return 0; }; done; return 1; }
+lport_list() { local IFS=, m out=""
+  for m in $LPORTS; do out+="${out:+,}${m#*=}"; done; echo "$out"; }
+in_list() { [[ ,$2, == *,"$1",* ]]; }
+
+sockopt='"sockopt": {"tcpKeepAliveIdle": 30, "tcpKeepAliveInterval": 10, "tcpUserTimeout": 30000}'
+policy='"policy": {"levels": {"0": {"handshake": 8, "connIdle": 300, "uplinkOnly": 2, "downlinkOnly": 5}}}'
+
+gen_json() {
+  local IFS=, p tags="" ins="" sni=""
+  if [ "$ROLE" = iran ]; then
+    for p in $PORTS; do
+      ins+="    {\"tag\": \"p$p\", \"listen\": \"0.0.0.0\", \"port\": $(lport "$p"), \"protocol\": \"dokodemo-door\",
+     \"settings\": {\"address\": \"$DEST\", \"port\": $p, \"network\": \"tcp,udp\"}},
+"
+      tags+="\"p$p\", "
+    done
+    [ -n "$SNI" ] && sni="\"serverName\": \"$SNI\", "
+    cat <<JSON
+{
+  "log": {"loglevel": "warning", "access": "none"},
+  $policy,
+  "inbounds": [
+$ins    {"tag": "health", "listen": "127.0.0.1", "port": $LHPORT, "protocol": "dokodemo-door",
+     "settings": {"address": "127.0.0.1", "port": $HPORT, "network": "tcp"}}
+  ],
+  "routing": {"rules": [{"inboundTag": [${tags}"health"], "outboundTag": "tunnel"}]},
+  "outbounds": [
+    {"tag": "block", "protocol": "blackhole"},
+    {"tag": "tunnel", "protocol": "vless",
+     "settings": {"address": "$REMOTE_IP", "port": $TPORT, "id": "$UUID", "encryption": "none"},
+     "streamSettings": {"network": "ws", "security": "tls",
+       "tlsSettings": {${sni}"fingerprint": "chrome", "alpn": ["http/1.1"], "pinnedPeerCertSha256": "$PIN"},
+       "wsSettings": {"path": "$WSPATH?ed=2560"},
+       $sockopt}}
+  ]
+}
+JSON
+  else
+    cat <<JSON
+{
+  "log": {"loglevel": "warning", "access": "none"},
+  $policy,
+  "inbounds": [
+    {"tag": "tunnel-in", "listen": "0.0.0.0", "port": $TPORT, "protocol": "vless",
+     "settings": {"decryption": "none", "clients": [{"id": "$UUID", "email": "iran"}]},
+     "streamSettings": {"network": "ws", "security": "tls",
+       "tlsSettings": {"minVersion": "1.3", "alpn": ["http/1.1"],
+         "certificates": [{"certificateFile": "$DIR/$N.crt", "keyFile": "$DIR/$N.key"}]},
+       "wsSettings": {"path": "$WSPATH"},
+       $sockopt}},
+    {"tag": "health", "listen": "127.0.0.1", "port": $HPORT, "protocol": "socks",
+     "settings": {"auth": "noauth", "udp": false}}
+  ],
+  "routing": {"rules": [
+    {"inboundTag": ["tunnel-in"], "ip": ["$DEST"], "port": "$PORTS", "outboundTag": "local"},
+    {"inboundTag": ["tunnel-in"], "ip": ["127.0.0.1"], "port": "$HPORT", "outboundTag": "local"}]},
+  "outbounds": [
+    {"tag": "block", "protocol": "blackhole"},
+    {"tag": "local", "protocol": "freedom",
+     "settings": {"finalRules": [
+       {"action": "allow", "network": "tcp,udp", "ip": ["$DEST"], "port": "$PORTS"},
+       {"action": "allow", "network": "tcp", "ip": ["127.0.0.1"], "port": "$HPORT"},
+       {"action": "block"}]}}
+  ]
+}
+JSON
+  fi
+}
+
+# Iran: users of the ports in ON are redirected to the local listener, which
+# sends them through the tunnel. Only the jump into the chain is switched on and
+# off; that affects new connections only, open ones keep their path.
+sync_chain() { local IFS=, p lp want="" r
+  iptables -w -t nat -N "$CHAIN" 2>/dev/null
+  for p in $ON; do
+    lp=$(lport "$p") || continue
+    for r in tcp udp; do
+      ipt_add nat -A "$CHAIN" -p "$r" --dport "$p" -j REDIRECT --to-ports "$lp"
+      want+="-A $CHAIN -p $r -m $r --dport $p -j REDIRECT --to-ports $lp"$'\n'
+    done
+  done
+  iptables -w -t nat -S "$CHAIN" 2>/dev/null | grep -- "^-A $CHAIN " | while IFS= read -r r; do
+    grep -qxF -- "$r" <<< "$want" && continue
+    IFS=' ' read -r -a a <<< "${r#-A }"
+    iptables -w -t nat -D "${a[@]}"
+  done
+}
+# Iran: the listeners take redirected users (also when INPUT drops by default, e.g. ufw)
+# and local programs, never direct connections
+guard() { local lps r; lps=$(lport_list)
+  for r in tcp udp; do
+    ipt_add filter -I INPUT ! -i lo -p "$r" -m multiport --dports "$lps" -m conntrack ! --ctstate DNAT "${TAG[@]}" -j DROP
+    ipt_add filter -I INPUT ! -i lo -p "$r" -m multiport --dports "$lps" -m conntrack --ctstate DNAT "${TAG[@]}" -j ACCEPT
+  done; }
+# foreign: the tunnel port answers only the Iran server
+fw_foreign() {
+  ipt_add filter -I INPUT -p tcp --dport "$TPORT" ! -s "$REMOTE_IP" "${TAG[@]}" -j DROP
+  ipt_add filter -I INPUT -p tcp --dport "$TPORT" -s "$REMOTE_IP" "${TAG[@]}" -j ACCEPT; }
+# deletes this tunnel's filter rules (they are tagged); with $1 = old, only the
+# ones left from older settings (other listener ports, tunnel port or Iran IP)
+unfw() { local r a lps; lps=$(lport_list)
+  iptables -w -S 2>/dev/null | grep -F -- "--comment xray-tunnel-$N " | while IFS= read -r r; do
+    if [ "${1:-}" = old ]; then
+      if [ "$ROLE" = iran ]; then [[ $r == *" --dports $lps "* ]] && continue
+      else [[ $r == *" -s $REMOTE_IP/32 "* && $r == *" --dport $TPORT "* ]] && continue; fi
+    fi
+    IFS=' ' read -r -a a <<< "${r#-A }"; iptables -w -D "${a[@]}"; done; }
+
+# Iran: the kernel must not give the listener ports to outgoing connections (a
+# widened ip_local_port_range can include them), or xray could not listen on them
+RES=/proc/sys/net/ipv4/ip_local_reserved_ports
+in_ranges() { awk -v p="$1" -v l="$2" 'BEGIN { n = split(l, t, ",")
+  for (i = 1; i <= n; i++) { k = split(t[i], r, "-"); if (t[i] != "" && p >= r[1] + 0 && p <= (k > 1 ? r[2] : r[1]) + 0) exit 0 }
+  exit 1 }'; }
+# the list is shared by all tunnels: one change at a time
+res_lock() { command -v flock >/dev/null || return 0; exec 8> /run/xray-tunnel.reserved.lock; flock -w 10 8; }
+reserve() { local IFS=, cur p add=""
+  [ -w "$RES" ] || return 0
+  res_lock; cur=$(cat "$RES")
+  for p in $(lport_list),$LHPORT; do in_ranges "$p" "$cur" || add+=",$p"; done
+  [ -z "$add" ] || echo "${cur}${add}" | sed 's/^,//' > "$RES"; }
+unreserve() { local cur
+  [ -w "$RES" ] || return 0
+  res_lock; cur=$(cat "$RES")
+  awk -v l="$cur" -v d="$(lport_list),$LHPORT" 'BEGIN { n = split(d, x, ","); for (i = 1; i <= n; i++) D[x[i] + 0] = 1
+    m = split(l, t, ","); out = ""
+    for (i = 1; i <= m; i++) { if (t[i] == "") continue
+      k = split(t[i], r, "-"); a = r[1] + 0; b = (k > 1 ? r[2] : r[1]) + 0; s = a
+      for (p = a; p <= b + 1; p++) if (p > b || (p in D)) {
+        if (s <= p - 1) out = out (out == "" ? "" : ",") (s == p - 1 ? s : s "-" (p - 1)); s = p + 1 } }
+    print out }' > "$RES"; }
+
+# our jump must come before every PREROUTING rule except other tunnels' jumps
+# (GRE's DNAT for the same ports is below it, and is used again once it is gone)
+jump_first() { local IFS=' '
+  iptables -w -t nat -S PREROUTING 2>/dev/null | awk -v want="-A ${JUMP[*]}" '
+    /^-A / { if ($0 == want) { ok = 1; exit } if ($0 !~ / -j XTUN[1-9]$/) exit }
+    END { exit !ok }'; }
+jump_on() {
+  jump_first && return 0
+  ipt_del nat "${JUMP[@]}"
+  iptables -w -t nat -I "${JUMP[@]:0:1}" 1 "${JUMP[@]:1}"; }
+release() { ipt_del nat "${JUMP[@]}"; }
+
+up() {
+  local new rc=0; new=$(gen_json)
+  if [ ! -f "$JSON" ] || [ "$(cat "$JSON")" != "$new" ]; then
+    printf '%s\n' "$new" > "$NEWJSON"
+    # settings xray rejects are not saved: the running ones and the next start keep working
+    if [ -x "$BIN" ] && ! "$BIN" run -test -c "$NEWJSON" >/dev/null 2>&1; then
+      echo "[!] xray rejects the new settings of tunnel $N:" >&2
+      "$BIN" run -test -c "$NEWJSON" 2>&1 | tail -5 >&2
+      log "new settings rejected by xray, not saved"; rc=1
+    else mv -f "$NEWJSON" "$JSON"; fi
+    rm -f "$NEWJSON"
+  fi
+  unfw old
+  if [ "$ROLE" = iran ]; then
+    reserve; sync_chain; guard
+    if [ -n "$ON" ]; then jump_on; else release; fi
+  else fw_foreign; fi
+  return $rc
+}
+down() {
+  local IFS=, lp
+  if [ "$ROLE" = iran ]; then
+    release
+    iptables -w -t nat -F "$CHAIN" 2>/dev/null; iptables -w -t nat -X "$CHAIN" 2>/dev/null
+    # UDP users keep their redirect while they send, even with nothing listening
+    # any more; without it their next packet goes to GRE
+    if command -v conntrack >/dev/null; then
+      for lp in $(lport_list); do conntrack -D -p udp --reply-port-src "$lp" >/dev/null 2>&1; done; fi
+    unreserve
+  fi
+  unfw
+  rm -f "$STATE" "$RUNNING"; true
+}
+
+# Iran: a SOCKS greeting to the foreign server's health listener, sent through
+# the tunnel, must come back as 05 00
+probe() { local r
+  r=$(timeout 5 bash -c "exec 3<>/dev/tcp/127.0.0.1/$LHPORT || exit 1; printf '\x05\x01\x00' >&3; head -c 2 <&3 | od -An -tx1" 2>/dev/null | tr -d ' \n')
+  [ "$r" = 0500 ]; }
+
+# Runs every 30 s: puts back rules that something removed (iptables -F, a GRE
+# tunnel restart that inserted its rules above ours) and logs when the tunnel
+# stops or starts answering. It never moves a port: only on/off does that.
+keep() { local st
+  up >/dev/null 2>&1
+  [ "$ROLE" = iran ] || return 0
+  if ! systemctl -q is-active "xray-tunnel@$N"; then st=stopped
+  elif probe; then st=ok; else st=fail; fi
+  if [ "$st" != "$(cat "$STATE" 2>/dev/null || echo ok)" ]; then
+    case $st in
+      fail) log "no answer from $REMOTE_IP through the tunnel; users of ports ${ON:-none} cannot connect. Move a port back to GRE: xray-tunnel off $N PORT" ;;
+      stopped) log "service xray-tunnel@$N is not running; users of ports ${ON:-none} cannot connect (journalctl -u xray-tunnel@$N)" ;;
+      ok) log "tunnel to $REMOTE_IP answers again" ;;
+    esac
+  fi
+  echo "$st" > "$STATE"
+}
+
+set_on() { local IFS=, p out=""
+  for p in $ON; do [ "$p" = "$ARG" ] || out+="${out:+,}$p"; done
+  [ "$1" = add ] && out+="${out:+,}$ARG"
+  ON=$out
+  if grep -q '^ON=' "$CONF"; then sed -i "s/^ON=.*/ON=$ON/" "$CONF"; else echo "ON=$ON" >> "$CONF"; fi
+  sync_chain
+  if [ -n "$ON" ]; then jump_on; else release; fi; }
+
+check() { local st c
+  echo "xray-tunnel $VERSION | tunnel $N | role $ROLE | peer $REMOTE_IP:$TPORT | ports $PORTS${ON:+ | on the tunnel: $ON}"
+  if systemctl -q is-active "xray-tunnel@$N"; then echo "[ok] service xray-tunnel@$N is running"
+  else echo "[!!] service xray-tunnel@$N is not running: journalctl -u xray-tunnel@$N -n 20"; fi
+  if [ -f "$RUNNING" ] && [ "$(cat "$RUNNING")" != "$(cat "$JSON" 2>/dev/null)" ]; then
+    echo "[i] new settings are saved but used only after: systemctl restart xray-tunnel@$N (cuts open tunnel connections)"; fi
+  if [ "$ROLE" = iran ]; then
+    c=$(ss -Htn state established dst "$REMOTE_IP" "( dport = :$TPORT )" 2>/dev/null | wc -l)
+    if probe; then echo "[ok] the foreign server answers through the tunnel ($c open tunnel connections)"; st=0
+    else echo "[!!] no answer through the tunnel (run 'xray-tunnel check $N' on $REMOTE_IP too)"; st=1; fi
+    if [ -z "$ON" ]; then echo "[i] no port uses the tunnel yet (move one: xray-tunnel on $N PORT)"
+    elif jump_first; then
+      echo "[ok] ports $ON use the tunnel (new connections)"
+    else echo "[!!] ports $ON should use the tunnel but its rule is not first (fixed within 30 s, or run: xray-tunnel up $N)"; fi
+    return $st
+  fi
+  c=$(ss -Htn state established src ":$TPORT" dst "$REMOTE_IP" 2>/dev/null | wc -l)
+  if ss -Hltn "( sport = :$TPORT )" 2>/dev/null | grep -q .; then echo "[ok] listening on port $TPORT ($c connections from $REMOTE_IP)"
+  else echo "[!!] nothing listens on port $TPORT"; return 1; fi
+}
+
+case "$CMD" in
+  up) up ;; down) down ;; keep) keep ;;
+  # the service starts xray with the settings on disk now
+  prestart) up; [ -f "$JSON" ] && cp -f "$JSON" "$RUNNING" ;;
+  check) check ;;
+  on|off)
+    [ "$ROLE" = iran ] || { echo "run this on the Iran server"; exit 1; }
+    [[ $ARG =~ ^[0-9]+$ ]] && in_list "$ARG" "$PORTS" || { echo "port '$ARG' is not one of this tunnel's ports ($PORTS)"; exit 1; }
+    if [ "$CMD" = on ]; then
+      probe || { echo "[!!] the tunnel does not answer (xray-tunnel check $N); port $ARG stays on GRE"; exit 1; }
+      ss -Hltn "( sport = :$(lport "$ARG") )" 2>/dev/null | grep -q . || {
+        echo "[!!] xray does not listen for port $ARG yet: it needs systemctl restart xray-tunnel@$N (cuts open tunnel connections); port $ARG stays on GRE"; exit 1; }
+      set_on add; log "port $ARG moved to the tunnel"
+      echo "port $ARG: new connections use the encrypted tunnel; open ones stay on GRE until they end"
+    else set_on del; log "port $ARG moved back to GRE"
+      echo "port $ARG: new connections use GRE again; open tunnel connections continue until they end"; fi ;;
+  *) echo "usage: xray-tunnel check|on|off|up|down|keep <N> [port] | version"; exit 1 ;;
+esac

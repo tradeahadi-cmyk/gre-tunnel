@@ -2,7 +2,7 @@
 # GRE tunnel runtime. Usage: gre-tunnel up|down|check|diag|watchdog <N>
 # Settings for tunnel N live in /etc/gre-tunnel/<N>.conf
 set -u
-VERSION=2.5.0
+VERSION=3.0.0
 CMD=${1:-}; N=${2:-}
 if [ "$CMD" = version ]; then echo "gre-tunnel $VERSION"; exit 0; fi
 CONF=/etc/gre-tunnel/$N.conf
@@ -86,6 +86,14 @@ tune_conntrack() {
     echo 7440 > $d/nf_conntrack_tcp_timeout_established; fi
 }
 
+# the encrypted tunnels' jumps (xray-tunnel) must stay above the port rules
+# just inserted at the top, or their ports would go back to GRE
+xt_above() { local f
+  [ -x /usr/local/sbin/xray-tunnel ] || return 0
+  for f in /etc/xray-tunnel/*.conf; do
+    [ -e "$f" ] && /usr/local/sbin/xray-tunnel up "$(basename "$f" .conf)" >/dev/null 2>&1
+  done; true; }
+
 # rules written by older versions of this script
 legacy_cleanup() {
   ipt_del filter -I INPUT ! -i vgre+ -p icmp --icmp-type echo-request -j DROP   # v2.0.x
@@ -110,7 +118,7 @@ up() {
   if [ "$ROLE" = iran ]; then sysctl -qw net.ipv4.ip_forward=1; fi
   FAIL=0; rules ipt_add
   legacy_cleanup
-  if [ "$ROLE" = iran ]; then tune_conntrack; fi
+  if [ "$ROLE" = iran ]; then tune_conntrack; xt_above; fi
   [ "$FAIL" = 0 ] || exit 1
   echo "$IF up: $MY_TIP <-> $PEER_TIP (mtu $MTU)"
 }
