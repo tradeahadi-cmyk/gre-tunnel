@@ -1,0 +1,76 @@
+#!/bin/bash
+# GRE tunnel runtime. Usage: gre-tunnel up|down|check|watchdog <N>
+# Settings for tunnel N live in /etc/gre-tunnel/<N>.conf
+set -u
+CMD=${1:-}; N=${2:-}
+CONF=/etc/gre-tunnel/$N.conf
+if [ -z "$N" ] || [ ! -f "$CONF" ]; then echo "usage: gre-tunnel up|down|check|watchdog <N>  (missing $CONF)"; exit 1; fi
+# shellcheck source=/dev/null
+. "$CONF"   # ROLE LOCAL_IP REMOTE_IP PORTS SSH_PORT
+
+IF=vgre$N
+IRAN_TIP=10.200.$N.2
+FOREIGN_TIP=10.200.$N.1
+if [ "$ROLE" = iran ]; then MY_TIP=$IRAN_TIP; PEER_TIP=$FOREIGN_TIP
+else MY_TIP=$FOREIGN_TIP; PEER_TIP=$IRAN_TIP; fi
+
+ipt_add() { local t=$1 op=$2; shift 2
+  iptables -w -t "$t" -C "$@" 2>/dev/null || iptables -w -t "$t" "$op" "$@"; }
+ipt_del() { local t=$1; shift 2
+  while iptables -w -t "$t" -C "$@" 2>/dev/null; do iptables -w -t "$t" -D "$@"; done; }
+
+# Every rule this tunnel uses, applied with ipt_add or ipt_del
+rules() { local f=$1
+  $f filter -I INPUT -p gre -s "$REMOTE_IP" -j ACCEPT
+  $f filter -I INPUT -i "$IF" -j ACCEPT
+  $f filter -I FORWARD -i "$IF" -j ACCEPT
+  $f filter -I FORWARD -o "$IF" -j ACCEPT
+  $f mangle -A FORWARD -o "$IF" -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu
+  $f mangle -A FORWARD -i "$IF" -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu
+  if [ "$ROLE" = iran ]; then
+    if [ "$PORTS" = all ]; then
+      # everything except SSH; GRE and ICMP are never matched
+      $f nat -A PREROUTING -d "$LOCAL_IP" -p tcp -m multiport ! --dports "$SSH_PORT" -j DNAT --to-destination "$PEER_TIP"
+      $f nat -A PREROUTING -d "$LOCAL_IP" -p udp -j DNAT --to-destination "$PEER_TIP"
+    else
+      $f nat -A PREROUTING -d "$LOCAL_IP" -p tcp -m multiport --dports "$PORTS" -j DNAT --to-destination "$PEER_TIP"
+      $f nat -A PREROUTING -d "$LOCAL_IP" -p udp -m multiport --dports "$PORTS" -j DNAT --to-destination "$PEER_TIP"
+    fi
+    $f nat -A POSTROUTING -o "$IF" -j MASQUERADE
+  fi
+}
+
+up() {
+  modprobe ip_gre 2>/dev/null
+  ip link show "$IF" >/dev/null 2>&1 && ip link del "$IF"
+  ip tunnel add "$IF" mode gre local "$LOCAL_IP" remote "$REMOTE_IP" ttl 255 || exit 1
+  ip link set "$IF" mtu 1476 up
+  ip addr replace "$MY_TIP/30" dev "$IF"
+  sysctl -qw net.ipv4.ip_forward=1
+  rules ipt_add
+  echo "$IF up: $MY_TIP <-> $PEER_TIP"
+}
+
+down() {
+  rules ipt_del
+  ip link del "$IF" 2>/dev/null
+  true
+}
+
+check() { ping -c 3 -W 2 -q "$PEER_TIP" >/dev/null 2>&1; }
+
+watchdog() {
+  local s=/run/gre-watchdog.$N
+  if check; then rm -f "$s"; exit 0; fi
+  local n=$(( $(cat "$s" 2>/dev/null || echo 0) + 1 )); echo "$n" > "$s"
+  if [ "$n" -ge 3 ]; then
+    logger -t gre-watchdog "tunnel $N: $PEER_TIP unreachable $n times, restarting"
+    rm -f "$s"; systemctl restart "gre-tunnel@$N"
+  fi
+}
+
+case "$CMD" in
+  up) up ;; down) down ;; watchdog) watchdog ;;
+  check) if check; then echo "tunnel $N OK ($PEER_TIP reachable)"; else echo "tunnel $N DOWN"; exit 1; fi ;;
+  *) echo "usage: gre-tunnel up|down|check|watchdog <N>"; exit 1 ;;
+esac
