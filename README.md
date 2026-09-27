@@ -14,7 +14,24 @@ bash <(curl -sSL https://raw.githubusercontent.com/tradeahadi-cmyk/gre-tunnel/ma
 
 نسخه‌ها و تغییرات هر نسخه در [CHANGELOG.md](CHANGELOG.md) است. هر نسخه در پوشه `versions/` هم نگه داشته می‌شود؛ برای نصب یک نسخه مشخص (مثلاً اگر نسخه جدید مشکل داشت):
 ```bash
-bash <(curl -sSL https://raw.githubusercontent.com/tradeahadi-cmyk/gre-tunnel/main/versions/v2.4.0/gre-install.sh)
+bash <(curl -sSL https://raw.githubusercontent.com/tradeahadi-cmyk/gre-tunnel/main/versions/v2.5.0/gre-install.sh)
+```
+
+## بدون دسترسی به گیت‌هاب
+- **روی سروری که اسکریپت را دارد:** از نسخه 2.5.0، منو روی خود سرور هم ذخیره می‌شود (با گزینه 1 یا 5). بدون اینترنت کافی است بزنید:
+```bash
+gre-install
+```
+  همه گزینه‌ها بدون اینترنت کار می‌کنند: نصب تانل جدید، حذف، وضعیت، عیب‌یابی و حذف کامل. فقط برای رفتن به نسخه جدیدتر باید فایل جدید را از یکی از دو راه زیر برسانید.
+- **لینک جایگزین (jsDelivr):** اگر گیت‌هاب باز نمی‌شود ولی jsDelivr باز است:
+```bash
+bash <(curl -sSL https://cdn.jsdelivr.net/gh/tradeahadi-cmyk/gre-tunnel@main/gre-install.sh)
+```
+  jsDelivr این لینک را تا ۱۲ ساعت نگه می‌دارد، پس ممکن است نسخه جدید تا ۱۲ ساعت دیرتر آنجا برسد. نسخه در بالای منو نوشته شده است.
+- **کپی دستی:** فایل را از کامپیوترتان (مثلاً با WinSCP) یا از سرور دیگری که آن را دارد کپی کنید و اجرا کنید:
+```bash
+scp /usr/local/sbin/gre-install root@IP-SERVER:/root/gre-install.sh   # روی سروری که فایل را دارد
+bash /root/gre-install.sh                                            # روی سرور مقصد
 ```
 
 ## تست

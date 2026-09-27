@@ -2,11 +2,11 @@
 # GRE tunnel runtime. Usage: gre-tunnel up|down|check|diag|watchdog <N>
 # Settings for tunnel N live in /etc/gre-tunnel/<N>.conf
 set -u
-VERSION=2.4.0
+VERSION=2.5.0
 CMD=${1:-}; N=${2:-}
 if [ "$CMD" = version ]; then echo "gre-tunnel $VERSION"; exit 0; fi
 CONF=/etc/gre-tunnel/$N.conf
-if [ -z "$N" ] || [ ! -f "$CONF" ]; then echo "usage: gre-tunnel up|down|check|diag|watchdog <N>  (missing $CONF)"; exit 1; fi
+if [ -z "$N" ] || [ ! -f "$CONF" ]; then echo "usage: gre-tunnel up|down|check|diag|watchdog <N>  (missing $CONF; menu: gre-install)"; exit 1; fi
 MTU=1420
 # shellcheck source=/dev/null
 . "$CONF"   # ROLE LOCAL_IP REMOTE_IP PORTS SSH_PORTS [MTU]
