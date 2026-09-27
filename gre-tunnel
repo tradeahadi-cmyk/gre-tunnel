@@ -5,8 +5,10 @@ set -u
 CMD=${1:-}; N=${2:-}
 CONF=/etc/gre-tunnel/$N.conf
 if [ -z "$N" ] || [ ! -f "$CONF" ]; then echo "usage: gre-tunnel up|down|check|watchdog <N>  (missing $CONF)"; exit 1; fi
+MTU=1420
 # shellcheck source=/dev/null
-. "$CONF"   # ROLE LOCAL_IP REMOTE_IP PORTS SSH_PORT
+. "$CONF"   # ROLE LOCAL_IP REMOTE_IP PORTS SSH_PORTS [MTU]
+SSH_PORTS=${SSH_PORTS:-${SSH_PORT:-22}}
 
 IF=vgre$N
 IRAN_TIP=10.200.$N.2
@@ -14,63 +16,132 @@ FOREIGN_TIP=10.200.$N.1
 if [ "$ROLE" = iran ]; then MY_TIP=$IRAN_TIP; PEER_TIP=$FOREIGN_TIP
 else MY_TIP=$FOREIGN_TIP; PEER_TIP=$IRAN_TIP; fi
 
+FAIL=0; MISSING=0
 ipt_add() { local t=$1 op=$2; shift 2
-  iptables -w -t "$t" -C "$@" 2>/dev/null || iptables -w -t "$t" "$op" "$@"; }
+  iptables -w -t "$t" -C "$@" 2>/dev/null && return 0
+  iptables -w -t "$t" "$op" "$@" || { echo "iptables failed: -t $t $op $*" >&2; FAIL=1; }; }
 ipt_del() { local t=$1; shift 2
   while iptables -w -t "$t" -C "$@" 2>/dev/null; do iptables -w -t "$t" -D "$@"; done; }
+ipt_chk() { local t=$1; shift 2
+  iptables -w -t "$t" -C "$@" 2>/dev/null || MISSING=1; }
 
-# Every rule this tunnel uses, applied with ipt_add or ipt_del
-rules() { local f=$1
+# multiport takes at most 15 ports (a range counts as 2), so split the list
+chunks() { local IFS=, p out="" i=0
+  for p in $1; do
+    out+="${out:+,}$p"; i=$((i + 1))
+    if [ "$i" -eq 7 ]; then echo "$out"; out=""; i=0; fi
+  done
+  if [ -n "$out" ]; then echo "$out"; fi; }
+
+# Every rule this tunnel uses, applied with ipt_add, ipt_del or ipt_chk
+rules() { local f=$1 c
   $f filter -I INPUT -p gre -s "$REMOTE_IP" -j ACCEPT
-  $f filter -I INPUT -i "$IF" -j ACCEPT
-  $f filter -I FORWARD -i "$IF" -j ACCEPT
-  $f filter -I FORWARD -o "$IF" -j ACCEPT
-  $f mangle -A FORWARD -o "$IF" -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu
-  $f mangle -A FORWARD -i "$IF" -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu
   if [ "$ROLE" = iran ]; then
+    $f filter -I FORWARD -i "$IF" -j ACCEPT
+    $f filter -I FORWARD -o "$IF" -j ACCEPT
+    if iptables -w -n -L DOCKER-USER >/dev/null 2>&1; then
+      $f filter -I DOCKER-USER -i "$IF" -j ACCEPT
+      $f filter -I DOCKER-USER -o "$IF" -j ACCEPT
+    fi
+    $f mangle -A FORWARD -o "$IF" -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss $((MTU - 40))
+    $f mangle -A FORWARD -i "$IF" -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss $((MTU - 40))
     if [ "$PORTS" = all ]; then
-      # everything except SSH; GRE and ICMP are never matched
-      $f nat -A PREROUTING -d "$LOCAL_IP" -p tcp -m multiport ! --dports "$SSH_PORT" -j DNAT --to-destination "$PEER_TIP"
-      $f nat -A PREROUTING -d "$LOCAL_IP" -p udp -j DNAT --to-destination "$PEER_TIP"
+      # everything except SSH; GRE, ICMP and traffic from the tunnels are never matched
+      $f nat -A PREROUTING ! -i vgre+ -m addrtype --dst-type LOCAL -p tcp -m multiport ! --dports "$SSH_PORTS" -j DNAT --to-destination "$PEER_TIP"
+      $f nat -A PREROUTING ! -i vgre+ -m addrtype --dst-type LOCAL -p udp -j DNAT --to-destination "$PEER_TIP"
     else
-      $f nat -A PREROUTING -d "$LOCAL_IP" -p tcp -m multiport --dports "$PORTS" -j DNAT --to-destination "$PEER_TIP"
-      $f nat -A PREROUTING -d "$LOCAL_IP" -p udp -m multiport --dports "$PORTS" -j DNAT --to-destination "$PEER_TIP"
+      # port rules go first (-I) so they always win over an 'all' rule
+      while read -r c; do
+        $f nat -I PREROUTING ! -i vgre+ -m addrtype --dst-type LOCAL -p tcp -m multiport --dports "$c" -j DNAT --to-destination "$PEER_TIP"
+        $f nat -I PREROUTING ! -i vgre+ -m addrtype --dst-type LOCAL -p udp -m multiport --dports "$c" -j DNAT --to-destination "$PEER_TIP"
+      done < <(chunks "$PORTS")
     fi
     $f nat -A POSTROUTING -o "$IF" -j MASQUERADE
+  else
+    # foreign: from the tunnel accept only the forwarded ports, not every service
+    $f filter -I INPUT -i "$IF" -p icmp -j ACCEPT
+    $f filter -I INPUT -i "$IF" -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
+    if [ "$PORTS" = all ]; then
+      $f filter -I INPUT -i "$IF" -j ACCEPT
+    else
+      while read -r c; do
+        $f filter -I INPUT -i "$IF" -p tcp -m multiport --dports "$c" -j ACCEPT
+        $f filter -I INPUT -i "$IF" -p udp -m multiport --dports "$c" -j ACCEPT
+      done < <(chunks "$PORTS")
+    fi
+    # hide from ping scans on the public IP (only echo-request; PMTU ICMP still works)
+    $f filter -I INPUT ! -i vgre+ -p icmp --icmp-type echo-request -j DROP
   fi
+}
+
+tune_conntrack() {
+  local d=/proc/sys/net/netfilter
+  if [ -w $d/nf_conntrack_max ] && [ "$(cat $d/nf_conntrack_max)" -lt 262144 ]; then
+    echo 262144 > $d/nf_conntrack_max; fi
+  if [ -w $d/nf_conntrack_tcp_timeout_established ] && [ "$(cat $d/nf_conntrack_tcp_timeout_established)" -gt 7440 ]; then
+    echo 7440 > $d/nf_conntrack_tcp_timeout_established; fi
 }
 
 up() {
   modprobe ip_gre 2>/dev/null
-  ip link show "$IF" >/dev/null 2>&1 && ip link del "$IF"
-  ip tunnel add "$IF" mode gre local "$LOCAL_IP" remote "$REMOTE_IP" ttl 255 || exit 1
-  ip link set "$IF" mtu 1476 up
+  ip link del vatan-m2 2>/dev/null   # old vatanhost tunnel, same endpoints
+  if ! ip link show "$IF" >/dev/null 2>&1; then
+    local other
+    other=$(ip tunnel show 2>/dev/null | awk -v me="$IF:" -v r="remote $REMOTE_IP " -v l="local $LOCAL_IP " \
+      'index($0" ", r) && index($0" ", l) && $1 != me { sub(":", "", $1); print $1 }')
+    if [ -n "$other" ]; then
+      echo "tunnel '$other' already uses $LOCAL_IP -> $REMOTE_IP; remove it first (ip link del $other)" >&2
+      logger -t gre-tunnel "$IF: tunnel $other already uses $LOCAL_IP -> $REMOTE_IP"
+      exit 1
+    fi
+    ip tunnel add "$IF" mode gre local "$LOCAL_IP" remote "$REMOTE_IP" ttl 255 || exit 1
+  fi
+  ip link set "$IF" mtu "$MTU" up
   ip addr replace "$MY_TIP/30" dev "$IF"
-  sysctl -qw net.ipv4.ip_forward=1
-  rules ipt_add
-  echo "$IF up: $MY_TIP <-> $PEER_TIP"
+  if [ "$ROLE" = iran ]; then sysctl -qw net.ipv4.ip_forward=1; fi
+  FAIL=0; rules ipt_add
+  if [ "$ROLE" = iran ]; then tune_conntrack; fi
+  [ "$FAIL" = 0 ] || exit 1
+  echo "$IF up: $MY_TIP <-> $PEER_TIP (mtu $MTU)"
 }
 
 down() {
   rules ipt_del
   ip link del "$IF" 2>/dev/null
+  rm -f "/run/gre-watchdog.$N" "/run/gre-watchdog.$N.rx"
   true
 }
 
 check() { ping -c 3 -W 2 -q "$PEER_TIP" >/dev/null 2>&1; }
 
+# Runs every 30s: repairs local state (link, rules, forwarding) if anything
+# removed it, and logs when the peer stops answering. It never restarts a
+# working tunnel, because that would drop every user's connection.
 watchdog() {
-  local s=/run/gre-watchdog.$N
-  if check; then rm -f "$s"; exit 0; fi
-  local n=$(( $(cat "$s" 2>/dev/null || echo 0) + 1 )); echo "$n" > "$s"
-  if [ "$n" -ge 3 ]; then
-    logger -t gre-watchdog "tunnel $N: $PEER_TIP unreachable $n times, restarting"
-    rm -f "$s"; systemctl restart "gre-tunnel@$N"
+  local s=/run/gre-watchdog.$N rx prev n
+  systemctl -q is-active "gre-tunnel@$N" || exit 0
+  MISSING=0; rules ipt_chk
+  ip link show "$IF" >/dev/null 2>&1 || MISSING=1
+  if [ "$ROLE" = iran ] && [ "$(cat /proc/sys/net/ipv4/ip_forward)" != 1 ]; then MISSING=1; fi
+  if [ "$MISSING" = 1 ]; then
+    logger -t gre-watchdog "tunnel $N: local config was removed, re-applying"
+    up >/dev/null 2>&1
+  fi
+  rx=$(cat "/sys/class/net/$IF/statistics/rx_packets" 2>/dev/null || echo 0)
+  prev=$(cat "$s.rx" 2>/dev/null || echo -1); echo "$rx" > "$s.rx"
+  if { [ "$prev" != -1 ] && [ "$rx" != "$prev" ]; } || check; then
+    if [ "$(cat "$s" 2>/dev/null || echo 0)" -ge 3 ]; then
+      logger -t gre-watchdog "tunnel $N: $PEER_TIP is reachable again"; fi
+    rm -f "$s"; exit 0
+  fi
+  n=$(( $(cat "$s" 2>/dev/null || echo 0) + 1 )); echo "$n" > "$s"
+  if [ "$n" -eq 3 ]; then
+    logger -t gre-watchdog "tunnel $N: no traffic from $PEER_TIP for 90s (peer down, or GRE blocked on the path)"
   fi
 }
 
 case "$CMD" in
   up) up ;; down) down ;; watchdog) watchdog ;;
-  check) if check; then echo "tunnel $N OK ($PEER_TIP reachable)"; else echo "tunnel $N DOWN"; exit 1; fi ;;
+  check) if check; then echo "tunnel $N OK ($PEER_TIP reachable)"; else echo "tunnel $N DOWN ($PEER_TIP not reachable)"; exit 1; fi ;;
   *) echo "usage: gre-tunnel up|down|check|watchdog <N>"; exit 1 ;;
 esac
