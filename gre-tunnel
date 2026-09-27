@@ -2,7 +2,7 @@
 # GRE tunnel runtime. Usage: gre-tunnel up|down|check|diag|watchdog <N>
 # Settings for tunnel N live in /etc/gre-tunnel/<N>.conf
 set -u
-VERSION=2.2.0
+VERSION=2.3.0
 CMD=${1:-}; N=${2:-}
 if [ "$CMD" = version ]; then echo "gre-tunnel $VERSION"; exit 0; fi
 CONF=/etc/gre-tunnel/$N.conf
@@ -158,7 +158,7 @@ diag() {
   tx1=$(cat "/sys/class/net/$IF/statistics/tx_packets" 2>/dev/null || echo 0)
   echo "ping $PEER_TIP: $pr ($IF sent $((tx1 - tx0)), received $((rx1 - rx0)) packets)"
   if [ "$pr" != ok ]; then
-    if tcp_probe 9 || tcp_probe 22; then tcp=ok; echo "tcp to $PEER_TIP: ok (the other server only ignores ping)"
+    if tcp_check; then tcp=ok; echo "tcp to $PEER_TIP: ok (the other server only ignores ping)"
     else tcp=FAILED; echo "tcp to $PEER_TIP: FAILED"; fi
   fi
   if [ -n "$cap" ]; then
@@ -187,9 +187,15 @@ diag() {
 tcp_probe() { local out rc
   out=$(timeout 4 bash -c "exec 3<>/dev/tcp/$PEER_TIP/$1" 2>&1); rc=$?
   [ "$rc" = 0 ] || [[ $out == *refused* ]]; }
+# On Iran, the first forwarded port is the best probe: the foreign server serves
+# it and accepts it from the tunnel. Ports 9 and 22 are fallbacks.
+tcp_check() { local p
+  if [ "$ROLE" = iran ] && [ "$PORTS" != all ]; then tcp_probe "${PORTS%%[,:]*}" && return 0; fi
+  for p in 9 22; do tcp_probe "$p" && return 0; done
+  return 1; }
 check() {
   ping -c 3 -W 2 -q "$PEER_TIP" >/dev/null 2>&1 && return 0
-  tcp_probe 9 || tcp_probe 22
+  tcp_check
 }
 
 # Runs every 30s: repairs local state (link, rules, forwarding) if anything
