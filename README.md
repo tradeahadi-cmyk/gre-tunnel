@@ -14,7 +14,7 @@ bash <(curl -sSL https://raw.githubusercontent.com/tradeahadi-cmyk/gre-tunnel/ma
 
 نسخه‌ها و تغییرات هر نسخه در [CHANGELOG.md](CHANGELOG.md) است. هر نسخه در پوشه `versions/` هم نگه داشته می‌شود؛ برای نصب یک نسخه مشخص (مثلاً اگر نسخه جدید مشکل داشت):
 ```bash
-bash <(curl -sSL https://raw.githubusercontent.com/tradeahadi-cmyk/gre-tunnel/main/versions/v2.1.0/gre-install.sh)
+bash <(curl -sSL https://raw.githubusercontent.com/tradeahadi-cmyk/gre-tunnel/main/versions/v2.2.0/gre-install.sh)
 ```
 
 ## تست
@@ -25,6 +25,9 @@ gre-tunnel diag 1                  # اگر کار نمی‌کند: علت را 
 systemctl status gre-tunnel@1
 journalctl -t gre-watchdog         # گزارش‌های واچ‌داگ
 ```
+
+## به‌روزرسانی
+همان دستور نصب و گزینه 5. تنظیمات عوض نمی‌شود و کاربران قطع نمی‌شوند. روی هر سه سرور بزنید.
 
 ## حذف
 همان دستور نصب و گزینه 2.

@@ -2,7 +2,7 @@
 # GRE tunnel runtime. Usage: gre-tunnel up|down|check|diag|watchdog <N>
 # Settings for tunnel N live in /etc/gre-tunnel/<N>.conf
 set -u
-VERSION=2.1.0
+VERSION=2.2.0
 CMD=${1:-}; N=${2:-}
 if [ "$CMD" = version ]; then echo "gre-tunnel $VERSION"; exit 0; fi
 CONF=/etc/gre-tunnel/$N.conf
@@ -39,6 +39,7 @@ chunks() { local IFS=, p out="" i=0
 rules() { local f=$1 c
   $f filter -I INPUT -p gre -s "$REMOTE_IP" -j ACCEPT
   if [ "$ROLE" = iran ]; then
+    $f filter -I INPUT -i "$IF" -p icmp -j ACCEPT
     $f filter -I FORWARD -i "$IF" -j ACCEPT
     $f filter -I FORWARD -o "$IF" -j ACCEPT
     if iptables -w -n -L DOCKER-USER >/dev/null 2>&1; then
@@ -124,7 +125,7 @@ down() {
 
 # Prints what is wrong with tunnel N, if anything
 diag() {
-  local wan dev src other rx0 tx0 rx1 tx1 cap="" nout=0 nin=0 pr
+  local wan dev src other rx0 tx0 rx1 tx1 cap="" nout=0 nin=0 pr tcp=""
   echo "gre-tunnel $VERSION | tunnel $N | role $ROLE | $LOCAL_IP -> $REMOTE_IP | ports $PORTS | mtu $MTU"
   wan=$(ip -4 -o addr show | awk -v ip="$LOCAL_IP" 'index($4, ip "/") == 1 { print $2; exit }')
   if [ -n "$wan" ]; then echo "[ok] $LOCAL_IP is on $wan"
@@ -156,13 +157,17 @@ diag() {
   rx1=$(cat "/sys/class/net/$IF/statistics/rx_packets" 2>/dev/null || echo 0)
   tx1=$(cat "/sys/class/net/$IF/statistics/tx_packets" 2>/dev/null || echo 0)
   echo "ping $PEER_TIP: $pr ($IF sent $((tx1 - tx0)), received $((rx1 - rx0)) packets)"
+  if [ "$pr" != ok ]; then
+    if tcp_probe 9 || tcp_probe 22; then tcp=ok; echo "tcp to $PEER_TIP: ok (the other server only ignores ping)"
+    else tcp=FAILED; echo "tcp to $PEER_TIP: FAILED"; fi
+  fi
   if [ -n "$cap" ]; then
     wait
     nout=$(grep -cF "IP $LOCAL_IP > $REMOTE_IP:" "$cap"); nin=$(grep -cF "IP $REMOTE_IP > $LOCAL_IP:" "$cap"); rm -f "$cap"
     echo "GRE packets on $wan: $nout sent to $REMOTE_IP, $nin received from $REMOTE_IP"
   fi
   echo
-  if [ "$pr" = ok ]; then echo "RESULT: tunnel works."
+  if [ "$pr" = ok ] || [ "$tcp" = ok ]; then echo "RESULT: tunnel works."
   elif [ -z "$cap" ]; then
     echo "RESULT: tunnel does not answer. For a clearer answer install tcpdump (apt install -y tcpdump) and run diag again, on both servers."
   elif [ "$nout" -gt 0 ] && [ "$nin" -eq 0 ]; then
@@ -177,7 +182,15 @@ diag() {
   fi
 }
 
-check() { ping -c 3 -W 2 -q "$PEER_TIP" >/dev/null 2>&1; }
+# The other server may ignore ping, so a TCP answer through the tunnel counts
+# too: even "connection refused" proves packets went there and came back.
+tcp_probe() { local out rc
+  out=$(timeout 4 bash -c "exec 3<>/dev/tcp/$PEER_TIP/$1" 2>&1); rc=$?
+  [ "$rc" = 0 ] || [[ $out == *refused* ]]; }
+check() {
+  ping -c 3 -W 2 -q "$PEER_TIP" >/dev/null 2>&1 && return 0
+  tcp_probe 9 || tcp_probe 22
+}
 
 # Runs every 30s: repairs local state (link, rules, forwarding) if anything
 # removed it, and logs when the peer stops answering. It never restarts a
