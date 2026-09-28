@@ -2,11 +2,11 @@
 # GRE tunnel runtime. Usage: gre-tunnel up|down|check|diag|watchdog <N>
 # Settings for tunnel N live in /etc/gre-tunnel/<N>.conf
 set -u
-VERSION=3.0.1
+VERSION=4.0.0
 CMD=${1:-}; N=${2:-}
 if [ "$CMD" = version ]; then echo "gre-tunnel $VERSION"; exit 0; fi
 CONF=/etc/gre-tunnel/$N.conf
-if [ -z "$N" ] || [ ! -f "$CONF" ]; then echo "usage: gre-tunnel up|down|check|diag|watchdog <N>  (missing $CONF; menu: gre-install)"; exit 1; fi
+if [ -z "$N" ] || [ ! -f "$CONF" ]; then echo "usage: gre-tunnel up|down|check|diag|watchdog <N>  (missing $CONF; menu: tunnel)"; exit 1; fi
 MTU=1420
 # shellcheck source=/dev/null
 . "$CONF"   # ROLE LOCAL_IP REMOTE_IP PORTS SSH_PORTS [MTU]
@@ -19,8 +19,14 @@ if [ "$ROLE" = iran ]; then MY_TIP=$IRAN_TIP; PEER_TIP=$FOREIGN_TIP
 else MY_TIP=$FOREIGN_TIP; PEER_TIP=$IRAN_TIP; fi
 
 FAIL=0; MISSING=0
-ipt_add() { local t=$1 op=$2; shift 2
+ipt_add() { local t=$1 op=$2 pos; shift 2
   iptables -w -t "$t" -C "$@" 2>/dev/null && return 0
+  # -Ibelow: first, but below the encrypted tunnels' jumps (xray-tunnel), so their
+  # ports never go to GRE for a moment while this tunnel starts
+  if [ "$op" = -Ibelow ]; then
+    pos=$(iptables -w -t "$t" -S "$1" 2>/dev/null | awk 'NR == 1 { next } / -j XTUN[1-9]$/ { n++; next } { exit } END { print n + 1 }')
+    set -- "$1" "$pos" "${@:2}"; op=-I
+  fi
   iptables -w -t "$t" "$op" "$@" || { echo "iptables failed: -t $t $op $*" >&2; FAIL=1; }; }
 ipt_del() { local t=$1; shift 2
   while iptables -w -t "$t" -C "$@" 2>/dev/null; do iptables -w -t "$t" -D "$@"; done; }
@@ -55,8 +61,8 @@ rules() { local f=$1 c
     else
       # port rules go first (-I) so they always win over an 'all' rule
       while read -r c; do
-        $f nat -I PREROUTING ! -i vgre+ -m addrtype --dst-type LOCAL -p tcp -m multiport --dports "$c" -j DNAT --to-destination "$PEER_TIP"
-        $f nat -I PREROUTING ! -i vgre+ -m addrtype --dst-type LOCAL -p udp -m multiport --dports "$c" -j DNAT --to-destination "$PEER_TIP"
+        $f nat -Ibelow PREROUTING ! -i vgre+ -m addrtype --dst-type LOCAL -p tcp -m multiport --dports "$c" -j DNAT --to-destination "$PEER_TIP"
+        $f nat -Ibelow PREROUTING ! -i vgre+ -m addrtype --dst-type LOCAL -p udp -m multiport --dports "$c" -j DNAT --to-destination "$PEER_TIP"
       done < <(chunks "$PORTS")
     fi
     $f nat -A POSTROUTING -o "$IF" -j MASQUERADE
@@ -107,7 +113,9 @@ up() {
     other=$(ip tunnel show 2>/dev/null | awk -v me="$IF:" -v r="remote $REMOTE_IP " -v l="local $LOCAL_IP " \
       'index($0" ", r) && index($0" ", l) && $1 != me { sub(":", "", $1); print $1 }')
     if [ -n "$other" ]; then
-      echo "tunnel '$other' already uses $LOCAL_IP -> $REMOTE_IP; remove it first (ip link del $other)" >&2
+      if [[ $other == vgre[1-9] ]] && [ -f "/etc/gre-tunnel/${other#vgre}.conf" ]; then
+        echo "tunnel ${other#vgre} of this script already connects $LOCAL_IP and $REMOTE_IP: use tunnel number ${other#vgre} (menu: tunnel)" >&2
+      else echo "tunnel '$other' already uses $LOCAL_IP -> $REMOTE_IP; remove it first (ip link del $other)" >&2; fi
       logger -t gre-tunnel "$IF: tunnel $other already uses $LOCAL_IP -> $REMOTE_IP"
       exit 1
     fi

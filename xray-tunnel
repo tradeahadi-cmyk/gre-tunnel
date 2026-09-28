@@ -5,14 +5,14 @@
 # Usage: xray-tunnel check|on|off <N> [port]   (up|down|keep|prestart: used by the services)
 # Settings for tunnel N live in /etc/xray-tunnel/<N>.conf
 set -u
-VERSION=3.0.1
+VERSION=4.0.0
 CMD=${1:-}; N=${2:-}; ARG=${3:-}
 DIR=/etc/xray-tunnel
 BIN=/usr/local/lib/xray-tunnel/xray
 if [ "$CMD" = version ]; then echo "xray-tunnel $VERSION"; exit 0; fi
 CONF=$DIR/$N.conf
 if ! [[ $N =~ ^[1-9]$ ]] || [ ! -f "$CONF" ]; then
-  echo "usage: xray-tunnel check|on|off|up|down|keep <N> [port]  (missing $CONF; menu: gre-install)"; exit 1; fi
+  echo "usage: xray-tunnel check|on|off|up|down|keep <N> [port]  (missing $CONF; menu: tunnel)"; exit 1; fi
 # one change at a time: the 30 s timer, on/off and the installer
 case "$CMD" in up|down|keep|on|off|prestart)
   if command -v flock >/dev/null; then
@@ -196,6 +196,8 @@ up() {
     else mv -f "$NEWJSON" "$JSON"; fi
     rm -f "$NEWJSON"
   fi
+  # the running copy holds the key too: only root reads it
+  [ -f "$RUNNING" ] && chmod 600 "$RUNNING"
   unfw old
   if [ "$ROLE" = iran ]; then
     reserve; sync_chain; guard
@@ -227,20 +229,29 @@ probe() { local r
 # Runs every 30 s: puts back rules that something removed (iptables -F, a GRE
 # tunnel restart that inserted its rules above ours) and logs when the tunnel
 # stops or starts answering. It never moves a port: only on/off does that.
-keep() { local st
+keep() { local st prev
   up >/dev/null 2>&1
   [ "$ROLE" = iran ] || return 0
+  prev=$(cat "$STATE" 2>/dev/null || echo ok)
   if ! systemctl -q is-active "xray-tunnel@$N"; then st=stopped
   elif probe; then st=ok; else st=fail; fi
-  if [ "$st" != "$(cat "$STATE" 2>/dev/null || echo ok)" ]; then
+  [ "$st" != ok ] && [ "$prev" != ok ] && unstick
+  if [ "$st" != "$prev" ]; then
     case $st in
-      fail) log "no answer from $REMOTE_IP through the tunnel; users of ports ${ON:-none} cannot connect. Move a port back to GRE: xray-tunnel off $N PORT" ;;
+      fail) log "no answer from $REMOTE_IP through the tunnel; users of ports ${ON:-none} cannot connect. Move its ports to GRE: tunnel switch $N gre" ;;
       stopped) log "service xray-tunnel@$N is not running; users of ports ${ON:-none} cannot connect (journalctl -u xray-tunnel@$N)" ;;
       ok) log "tunnel to $REMOTE_IP answers again" ;;
     esac
   fi
   echo "$st" > "$STATE"
 }
+
+flush_udp() { conntrack -D -p udp --reply-port-src "$1" >/dev/null 2>&1; true; }
+# ports already moved back to GRE by hand: UDP users who still send to the dead
+# tunnel (their redirect stays while they send) go to GRE once it is dead for 30 s
+unstick() { local IFS=, m
+  command -v conntrack >/dev/null || return 0
+  for m in $LPORTS; do in_list "${m%%=*}" "$ON" || flush_udp "${m#*=}"; done; }
 
 set_on() { local IFS=, p out=""
   for p in $ON; do [ "$p" = "$ARG" ] || out+="${out:+,}$p"; done
@@ -274,7 +285,7 @@ check() { local st c
 case "$CMD" in
   up) up ;; down) down ;; keep) keep ;;
   # the service starts xray with the settings on disk now
-  prestart) up; [ -f "$JSON" ] && cp -f "$JSON" "$RUNNING" ;;
+  prestart) up; [ -f "$JSON" ] && install -m 600 "$JSON" "$RUNNING" ;;
   check) check ;;
   on|off)
     [ "$ROLE" = iran ] || { echo "run this on the Iran server"; exit 1; }
@@ -286,6 +297,13 @@ case "$CMD" in
       set_on add; log "port $ARG moved to the tunnel"
       echo "port $ARG: new connections use the encrypted tunnel; open ones stay on GRE until they end"
     else set_on del; log "port $ARG moved back to GRE"
-      echo "port $ARG: new connections use GRE again; open tunnel connections continue until they end"; fi ;;
+      echo "port $ARG: new connections use GRE again; open tunnel connections continue until they end"
+      # UDP users keep their redirect while they send. When the tunnel is dead (the
+      # 30 s check found it dead and it still does not answer) they would stay cut,
+      # so they are moved to GRE now; on a working tunnel they stay, like TCP users
+      if command -v conntrack >/dev/null && [ "$(cat "$STATE" 2>/dev/null || echo ok)" != ok ] && ! probe; then
+        flush_udp "$(lport "$ARG")"
+        echo "the tunnel does not answer: UDP users of port $ARG were moved to GRE too"; fi
+    fi ;;
   *) echo "usage: xray-tunnel check|on|off|up|down|keep <N> [port] | version"; exit 1 ;;
 esac
