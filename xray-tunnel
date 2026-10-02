@@ -1,14 +1,18 @@
 #!/bin/bash
-# Encrypted tunnel runtime: VLESS + WebSocket + TLS from Iran to a foreign server,
-# one encrypted connection per user connection. Runs next to the GRE tunnel with
-# the same number; ports are moved onto it and back to GRE only by hand (on/off).
-# Usage: xray-tunnel check|on|off <N> [port]   (up|down|keep|prestart: used by the services)
+# Encrypted tunnel runtime: one encrypted connection per user connection, next to
+# the GRE tunnel with the same number; ports are moved onto it and back to GRE only
+# by hand (on/off). Two kinds (MODE in the settings):
+#   forward: Iran opens VLESS + WebSocket + TLS connections to the foreign server (xray)
+#   reverse: the foreign server opens the TLS connections to Iran (frp, no multiplexing:
+#            one connection per user connection), for when Iran's connections to it are blocked
+# Usage: xray-tunnel check|on|off <N> [port]   (up|down|keep|prestart|run|current: used by the services)
 # Settings for tunnel N live in /etc/xray-tunnel/<N>.conf
 set -u
-VERSION=4.0.0
+VERSION=4.1.0
 CMD=${1:-}; N=${2:-}; ARG=${3:-}
 DIR=/etc/xray-tunnel
-BIN=/usr/local/lib/xray-tunnel/xray
+LIB=/usr/local/lib/xray-tunnel
+BIN=$LIB/xray
 if [ "$CMD" = version ]; then echo "xray-tunnel $VERSION"; exit 0; fi
 CONF=$DIR/$N.conf
 if ! [[ $N =~ ^[1-9]$ ]] || [ ! -f "$CONF" ]; then
@@ -19,15 +23,23 @@ case "$CMD" in up|down|keep|on|off|prestart)
     exec 9> "/run/xray-tunnel.$N.lock"; flock -w 30 9 || { echo "tunnel $N is busy, try again"; exit 1; }
   fi ;;
 esac
-ON=""; PIN=""; LPORTS=""; LHPORT=""; SNI=""; DEST=127.0.0.1
+ON=""; PIN=""; LPORTS=""; LHPORT=""; SNI=""; DEST=127.0.0.1; MODE=forward; TOKEN=""; HPASS=""; POOL=50
+ULBASE=""; UDPK=8; PUBLIC_IP=""; APORT=""
 # shellcheck source=/dev/null
-. "$CONF"   # ROLE REMOTE_IP TPORT UUID WSPATH SNI PORTS HPORT DEST; iran: PIN LPORTS LHPORT ON
-JSON=$DIR/$N.json
-NEWJSON=$DIR/$N.new.json   # xray reads the format from the .json ending
+. "$CONF"   # ROLE REMOTE_IP TPORT SNI PORTS DEST; forward: UUID WSPATH HPORT, iran: PIN;
+            # reverse: MODE TOKEN HPASS LPORTS LHPORT ULBASE UDPK, foreign: POOL APORT; iran: LPORTS LHPORT ON
+if [ "$MODE" = reverse ]; then
+  EXT=toml; OTHER=json
+  if [ "$ROLE" = iran ]; then BIN=$LIB/frps; else BIN=$LIB/frpc; fi
+else EXT=json; OTHER=toml; fi
+CFG=$DIR/$N.$EXT
+NEWCFG=$DIR/$N.new.$EXT   # xray and frp read the format from the file ending
 CHAIN=XTUN$N
 STATE=/run/xray-tunnel.$N
-# copy of the settings the running xray was started with
-RUNNING=/run/xray-tunnel.$N.json
+# copy of the settings the running program was started with
+RUNNING=/run/xray-tunnel.$N.$EXT
+# kind, tunnel port and peer of the running program (its firewall stays until it restarts)
+FWRUN=/run/xray-tunnel.$N.fw
 JUMP=(PREROUTING ! -i vgre+ -m addrtype --dst-type LOCAL -j "$CHAIN")
 TAG=(-m comment --comment "xray-tunnel-$N")
 
@@ -43,6 +55,35 @@ lport() { local IFS=, m
 lport_list() { local IFS=, m out=""
   for m in $LPORTS; do out+="${out:+,}${m#*=}"; done; echo "$out"; }
 in_list() { [[ ,$2, == *,"$1",* ]]; }
+
+# reverse: the UDP of user port $1 is spread over UDPK local ports (one frp
+# connection each; conntrack keeps every user flow on one of them), a block from
+# ULBASE in the order of PORTS. Prints "first-last" (one port alone, as iptables
+# lists it); nothing without ULBASE
+urange() { local IFS=, p i=0 a
+  [ "$MODE" = reverse ] && [ -n "$ULBASE" ] || return 1
+  for p in $PORTS; do
+    a=$((ULBASE + i * UDPK))
+    [ "$p" = "$1" ] && { if [ "$UDPK" -gt 1 ]; then echo "$a-$((a + UDPK - 1))"; else echo "$a"; fi; return 0; }
+    i=$((i + 1)); done; return 1; }
+# the whole block, as first:last
+ublock() { local n
+  [ "$MODE" = reverse ] && [ -n "$ULBASE" ] || return 1
+  n=$(tr , '\n' <<< "$PORTS" | grep -c .)
+  if [ $((n * UDPK)) -gt 1 ]; then echo "$ULBASE:$((ULBASE + n * UDPK - 1))"; else echo "$ULBASE"; fi; }
+# local UDP ports of user port $1, one per line
+uports() { local r; r=$(urange "$1") && seq "${r%-*}" "${r#*-}" || lport "$1"; }
+
+# reverse, Iran: the program listens on the tunnel's local ports only while the
+# foreign server is connected; the health port is one of them there
+gports() { if [ "$MODE" = reverse ]; then echo "$(lport_list),$LHPORT"; else lport_list; fi; }
+# reverse: the name the foreign server checks in the certificate. Without a name
+# it connects to the Iran IP, so no name is sent in the TLS handshake
+sname() { echo "${SNI:-$REMOTE_IP}"; }
+# the certificate the program uses: foreign reverse trusts Iran's ($N.ca.crt), the
+# others serve their own ($N.crt)
+cafile() { if [ "$MODE" = reverse ] && [ "$ROLE" != iran ]; then echo "$DIR/$N.ca.crt"; else echo "$DIR/$N.crt"; fi; }
+certfp() { openssl x509 -in "$(cafile)" -noout -fingerprint -sha256 2>/dev/null | cut -d= -f2 | tr -d :; }
 
 sockopt='"sockopt": {"tcpKeepAliveIdle": 30, "tcpKeepAliveInterval": 10, "tcpUserTimeout": 30000}'
 policy='"policy": {"levels": {"0": {"handshake": 8, "connIdle": 300, "uplinkOnly": 2, "downlinkOnly": 5}}}'
@@ -109,44 +150,182 @@ JSON
   fi
 }
 
+# reverse: frps on Iran (the foreign server logs in and opens the local ports), frpc
+# on the foreign server. No multiplexing: every user connection gets its own TLS
+# connection, taken from a pool the foreign server keeps open to Iran
+gen_toml() {
+  local IFS=, p allow="" u k
+  if [ "$ROLE" = iran ]; then
+    for p in $(gports); do allow+="${allow:+, }{ single = $p }"; done
+    u=$(ublock) && allow+=", { start = ${u%:*}, end = ${u#*:} }"
+    # a new certificate is new settings: the program restarts to use it
+    cat <<TOML
+# certificate $(certfp)
+bindAddr = "0.0.0.0"
+bindPort = $TPORT
+proxyBindAddr = "0.0.0.0"
+allowPorts = [ $allow ]
+userConnTimeout = 10
+udpPacketSize = 7000
+detailedErrorsToClient = false
+auth.method = "token"
+auth.token = "$TOKEN"
+# the token also signs heartbeats and each new work connection, so a work connection
+# cannot be offered by someone who knows only the run ID frp logs
+auth.additionalScopes = ["HeartBeats", "NewWorkConns"]
+transport.tcpMux = false
+transport.maxPoolCount = 200
+transport.tcpKeepalive = 30
+transport.heartbeatTimeout = 45
+transport.tls.force = true
+transport.tls.certFile = "$DIR/$N.crt"
+transport.tls.keyFile = "$DIR/$N.key"
+log.to = "console"
+log.level = "warn"
+TOML
+  else
+    cat <<TOML
+# certificate $(certfp)
+serverAddr = "$REMOTE_IP"
+serverPort = $TPORT
+loginFailExit = false
+udpPacketSize = 7000
+auth.method = "token"
+auth.token = "$TOKEN"
+auth.additionalScopes = ["HeartBeats", "NewWorkConns"]
+transport.protocol = "tcp"
+transport.tcpMux = false
+transport.poolCount = $POOL
+transport.dialServerTimeout = 10
+transport.dialServerKeepalive = 30
+# frequent heartbeats: a lost request for work connections (frp issue 5549) is found soon
+transport.heartbeatInterval = 10
+transport.heartbeatTimeout = 45
+transport.tls.enable = true
+transport.tls.serverName = "$(sname)"
+transport.tls.trustedCaFile = "$(cafile)"
+log.to = "console"
+log.level = "warn"
+TOML
+    # from the IP Iran accepts (a server with several IPs would use its main one)
+    ip -o -4 addr show 2>/dev/null | grep -qF " $PUBLIC_IP/" && echo "transport.connectServerLocalIP = \"$PUBLIC_IP\""
+    # status page on this server's loopback: it shows whether frpc is logged in to Iran
+    aport_ok && printf 'webServer.addr = "127.0.0.1"\nwebServer.port = %s\nwebServer.user = "health"\nwebServer.password = "%s"\n' "$APORT" "$HPASS"
+    for p in $PORTS; do
+      printf '\n[[proxies]]\nname = "t%s-tcp-%s"\ntype = "tcp"\nlocalIP = "%s"\nlocalPort = %s\nremotePort = %s\n' "$N" "$p" "$DEST" "$p" "$(lport "$p")"
+      k=0
+      for u in $(uports "$p" | paste -sd, -); do
+        k=$((k + 1))
+        printf '\n[[proxies]]\nname = "t%s-udp-%s-%s"\ntype = "udp"\nlocalIP = "%s"\nlocalPort = %s\nremotePort = %s\n' "$N" "$p" "$k" "$DEST" "$p" "$u"
+      done
+    done
+    # Iran checks the tunnel with an HTTP request to this port, answered here by a
+    # password-protected web server of an empty folder: it connects nowhere
+    printf '\n[[proxies]]\nname = "t%s-health"\ntype = "tcp"\nremotePort = %s\n[proxies.plugin]\ntype = "static_file"\nlocalPath = "%s"\nhttpUser = "health"\nhttpPassword = "%s"\n' "$N" "$LHPORT" "$LIB/empty" "$HPASS"
+  fi
+}
+gen_cfg() { if [ "$MODE" = reverse ]; then gen_toml; else gen_json; fi; }
+# settings the program rejects are not saved
+cfg_ok() { [ -x "$BIN" ] || return 0
+  if [ "$MODE" = reverse ]; then "$BIN" verify -c "$1"; else "$BIN" run -test -c "$1"; fi; }
+
 # Iran: users of the ports in ON are redirected to the local listener, which
 # sends them through the tunnel. Only the jump into the chain is switched on and
 # off; that affects new connections only, open ones keep their path.
-sync_chain() { local IFS=, p lp want="" r
+sync_chain() { local IFS=, p lp want="" r u
   iptables -w -t nat -N "$CHAIN" 2>/dev/null
   for p in $ON; do
     lp=$(lport "$p") || continue
-    for r in tcp udp; do
-      ipt_add nat -A "$CHAIN" -p "$r" --dport "$p" -j REDIRECT --to-ports "$lp"
-      want+="-A $CHAIN -p $r -m $r --dport $p -j REDIRECT --to-ports $lp"$'\n'
-    done
+    ipt_add nat -A "$CHAIN" -p tcp --dport "$p" -j REDIRECT --to-ports "$lp"
+    want+="-A $CHAIN -p tcp -m tcp --dport $p -j REDIRECT --to-ports $lp"$'\n'
+    if u=$(urange "$p"); then
+      ipt_add nat -A "$CHAIN" -p udp --dport "$p" -j REDIRECT --to-ports "$u" --random
+      want+="-A $CHAIN -p udp -m udp --dport $p -j REDIRECT --to-ports $u --random"$'\n'
+    else
+      ipt_add nat -A "$CHAIN" -p udp --dport "$p" -j REDIRECT --to-ports "$lp"
+      want+="-A $CHAIN -p udp -m udp --dport $p -j REDIRECT --to-ports $lp"$'\n'
+    fi
   done
   iptables -w -t nat -S "$CHAIN" 2>/dev/null | grep -- "^-A $CHAIN " | while IFS= read -r r; do
     grep -qxF -- "$r" <<< "$want" && continue
     IFS=' ' read -r -a a <<< "${r#-A }"
     iptables -w -t nat -D "${a[@]}"
+    # the UDP of a port now goes to other local ports (the kind changed): its users
+    # keep the old ones while they send, where nothing listens any more
+    if [[ $r =~ -p\ udp\ .*--dport\ ([0-9]+)\ -j\ REDIRECT\ --to-ports\ ([0-9]+)(-([0-9]+))? ]] &&
+       grep -q -- "-p udp -m udp --dport ${BASH_REMATCH[1]} " <<< "$want" && command -v conntrack >/dev/null; then
+      p=${BASH_REMATCH[1]}
+      for u in $(seq -s, "${BASH_REMATCH[2]}" "${BASH_REMATCH[4]:-${BASH_REMATCH[2]}}"); do
+        conntrack -D -p udp --orig-port-dst "$p" --reply-port-src "$u" >/dev/null 2>&1; done
+    fi
   done
 }
 # Iran: the listeners take redirected users (also when INPUT drops by default, e.g. ufw)
 # and local programs, never direct connections
-guard() { local lps r; lps=$(lport_list)
+guard() { local lps r u; lps=$(gports)
   for r in tcp udp; do
     ipt_add filter -I INPUT ! -i lo -p "$r" -m multiport --dports "$lps" -m conntrack ! --ctstate DNAT "${TAG[@]}" -j DROP
     ipt_add filter -I INPUT ! -i lo -p "$r" -m multiport --dports "$lps" -m conntrack --ctstate DNAT "${TAG[@]}" -j ACCEPT
-  done; }
-# foreign: the tunnel port answers only the Iran server
-fw_foreign() {
-  ipt_add filter -I INPUT -p tcp --dport "$TPORT" ! -s "$REMOTE_IP" "${TAG[@]}" -j DROP
-  ipt_add filter -I INPUT -p tcp --dport "$TPORT" -s "$REMOTE_IP" "${TAG[@]}" -j ACCEPT; }
+  done
+  if u=$(ublock); then
+    ipt_add filter -I INPUT ! -i lo -p udp --dport "$u" -m conntrack ! --ctstate DNAT "${TAG[@]}" -j DROP
+    ipt_add filter -I INPUT ! -i lo -p udp --dport "$u" -m conntrack --ctstate DNAT "${TAG[@]}" -j ACCEPT
+  fi; }
+# does a program of kind $2 listen on the tunnel port on a server of role $1
+# (forward: the foreign server, reverse: the Iran server)
+listens() { if [ "$1" = iran ]; then [ "$2" = reverse ]; else [ "$2" != reverse ]; fi; }
+is_current() { [ -f "$RUNNING" ] && [ "$(cat "$RUNNING")" = "$(cat "$CFG" 2>/dev/null)" ]; }
+# "PORT IP": tunnel ports here that answer only that IP. Those of the settings, and
+# until it restarts, the one of the program still running with older settings
+fw_pairs() { local m t ip
+  listens "$ROLE" "$MODE" && echo "$TPORT $REMOTE_IP"
+  if [ -f "$FWRUN" ] && ! is_current; then
+    read -r m t ip < "$FWRUN"
+    if [ -n "$t" ] && listens "$ROLE" "$m" && { ! listens "$ROLE" "$MODE" || [ "$t" != "$TPORT" ]; }; then echo "$t $ip"; fi
+  fi; true; }
+fw_in() { local t ip
+  while read -r t ip; do
+    [ -n "$t" ] || continue
+    ipt_add filter -I INPUT -p tcp --dport "$t" ! -s "$ip" "${TAG[@]}" -j DROP
+    ipt_add filter -I INPUT -p tcp --dport "$t" -s "$ip" "${TAG[@]}" -j ACCEPT
+  done <<< "$(fw_pairs)"; }
 # deletes this tunnel's filter rules (they are tagged); with $1 = old, only the
-# ones left from older settings (other listener ports, tunnel port or Iran IP)
-unfw() { local r a lps; lps=$(lport_list)
+# ones left from older settings (other listener ports, tunnel port or peer IP)
+unfw() { local r a lps u pairs keep t ip; lps=$(gports); u=$(ublock) || u=""; pairs=$(fw_pairs)
   iptables -w -S 2>/dev/null | grep -F -- "--comment xray-tunnel-$N " | while IFS= read -r r; do
     if [ "${1:-}" = old ]; then
-      if [ "$ROLE" = iran ]; then [[ $r == *" --dports $lps "* ]] && continue
-      else [[ $r == *" -s $REMOTE_IP/32 "* && $r == *" --dport $TPORT "* ]] && continue; fi
+      keep=0
+      if [ "$ROLE" = iran ]; then
+        [[ $r == *" --dports $lps "* ]] && keep=1
+        [ -n "$u" ] && [[ $r == *" --dport $u "* ]] && keep=1
+      fi
+      while read -r t ip; do
+        [ -n "$t" ] && [[ $r == *" -s $ip/32 "* && $r == *" --dport $t "* ]] && keep=1
+      done <<< "$pairs"
+      [ "$keep" = 1 ] && continue
     fi
     IFS=' ' read -r -a a <<< "${r#-A }"; iptables -w -D "${a[@]}"; done; }
+# IPv6: the programs listen on all addresses, IPv6 too, but the tunnel uses only
+# IPv4: its ports are closed there. $1 = all: removes these rules
+fw6() { local w="" r a lps u t ip
+  command -v ip6tables >/dev/null && ip6tables -w -S INPUT >/dev/null 2>&1 || return 0
+  if [ "${1:-}" != all ]; then
+    if [ "$ROLE" = iran ]; then lps=$(gports)
+      for r in tcp udp; do w+="-A INPUT ! -i lo -p $r -m multiport --dports $lps -m comment --comment xray-tunnel-$N -j DROP"$'\n'; done
+      u=$(ublock) && w+="-A INPUT ! -i lo -p udp -m udp --dport $u -m comment --comment xray-tunnel-$N -j DROP"$'\n'
+    fi
+    while read -r t ip; do
+      [ -n "$t" ] && w+="-A INPUT ! -i lo -p tcp -m tcp --dport $t -m comment --comment xray-tunnel-$N -j DROP"$'\n'
+    done <<< "$(fw_pairs)"
+  fi
+  ip6tables -w -S INPUT 2>/dev/null | grep -F -- "--comment xray-tunnel-$N " | while IFS= read -r r; do
+    grep -qxF -- "$r" <<< "$w" && continue
+    IFS=' ' read -r -a a <<< "${r#-A }"; ip6tables -w -D "${a[@]}"; done
+  while IFS= read -r r; do
+    [ -n "$r" ] || continue
+    IFS=' ' read -r -a a <<< "${r#-A INPUT }"
+    ip6tables -w -C INPUT "${a[@]}" 2>/dev/null || ip6tables -w -I INPUT "${a[@]}"
+  done <<< "$w"; }
 
 # Iran: the kernel must not give the listener ports to outgoing connections (a
 # widened ip_local_port_range can include them), or xray could not listen on them
@@ -154,23 +333,37 @@ RES=/proc/sys/net/ipv4/ip_local_reserved_ports
 in_ranges() { awk -v p="$1" -v l="$2" 'BEGIN { n = split(l, t, ",")
   for (i = 1; i <= n; i++) { k = split(t[i], r, "-"); if (t[i] != "" && p >= r[1] + 0 && p <= (k > 1 ? r[2] : r[1]) + 0) exit 0 }
   exit 1 }'; }
+# reverse: the port the foreign server connects to, too
+res_list() { local l u; l="$(lport_list),$LHPORT"
+  [ "$MODE" = reverse ] && l+=",$TPORT"
+  u=$(ublock) && l+=",$(seq "${u%:*}" "${u#*:}" | paste -sd, -)"
+  echo "$l"; }
 # the list is shared by all tunnels: one change at a time
 res_lock() { command -v flock >/dev/null || return 0; exec 8> /run/xray-tunnel.reserved.lock; flock -w 10 8; }
-reserve() { local IFS=, cur p add=""
-  [ -w "$RES" ] || return 0
-  res_lock; cur=$(cat "$RES")
-  for p in $(lport_list),$LHPORT; do in_ranges "$p" "$cur" || add+=",$p"; done
-  [ -z "$add" ] || echo "${cur}${add}" | sed 's/^,//' > "$RES"; }
-unreserve() { local cur
-  [ -w "$RES" ] || return 0
-  res_lock; cur=$(cat "$RES")
-  awk -v l="$cur" -v d="$(lport_list),$LHPORT" 'BEGIN { n = split(d, x, ","); for (i = 1; i <= n; i++) D[x[i] + 0] = 1
+# the ports this tunnel reserved last, so a port it no longer uses (another kind or
+# other settings) is given back
+RESLAST=/run/xray-tunnel.$N.res
+res_remove() { local cur
+  cur=$(cat "$RES")
+  awk -v l="$cur" -v d="$1" 'BEGIN { n = split(d, x, ","); for (i = 1; i <= n; i++) if (x[i] != "") D[x[i] + 0] = 1
     m = split(l, t, ","); out = ""
     for (i = 1; i <= m; i++) { if (t[i] == "") continue
       k = split(t[i], r, "-"); a = r[1] + 0; b = (k > 1 ? r[2] : r[1]) + 0; s = a
       for (p = a; p <= b + 1; p++) if (p > b || (p in D)) {
         if (s <= p - 1) out = out (out == "" ? "" : ",") (s == p - 1 ? s : s "-" (p - 1)); s = p + 1 } }
     print out }' > "$RES"; }
+reserve() { local IFS=, cur p add="" want gone=""
+  [ -w "$RES" ] || return 0
+  res_lock; want=$(res_list)
+  for p in $(cat "$RESLAST" 2>/dev/null); do in_list "$p" "$want" || gone+=",$p"; done
+  [ -z "$gone" ] || res_remove "$gone"
+  cur=$(cat "$RES")
+  for p in $want; do in_ranges "$p" "$cur" || add+=",$p"; done
+  [ -z "$add" ] || echo "${cur}${add}" | sed 's/^,//' > "$RES"
+  echo "$want" > "$RESLAST"; }
+unreserve() {
+  [ -w "$RES" ] || return 0
+  res_lock; res_remove "$(res_list),$(cat "$RESLAST" 2>/dev/null)"; rm -f "$RESLAST"; }
 
 # our jump must come before every PREROUTING rule except other tunnels' jumps
 # (GRE's DNAT for the same ports is below it, and is used again once it is gone)
@@ -185,53 +378,128 @@ jump_on() {
 release() { ipt_del nat "${JUMP[@]}"; }
 
 up() {
-  local new rc=0; new=$(gen_json)
-  if [ ! -f "$JSON" ] || [ "$(cat "$JSON")" != "$new" ]; then
-    printf '%s\n' "$new" > "$NEWJSON"
-    # settings xray rejects are not saved: the running ones and the next start keep working
-    if [ -x "$BIN" ] && ! "$BIN" run -test -c "$NEWJSON" >/dev/null 2>&1; then
-      echo "[!] xray rejects the new settings of tunnel $N:" >&2
-      "$BIN" run -test -c "$NEWJSON" 2>&1 | tail -5 >&2
-      log "new settings rejected by xray, not saved"; rc=1
-    else mv -f "$NEWJSON" "$JSON"; fi
-    rm -f "$NEWJSON"
+  local new rc=0; new=$(gen_cfg)
+  if [ ! -f "$CFG" ] || [ "$(cat "$CFG")" != "$new" ]; then
+    (umask 077; printf '%s\n' "$new" > "$NEWCFG")
+    # settings the program rejects are not saved: the running ones and the next start keep working
+    if ! cfg_ok "$NEWCFG" >/dev/null 2>&1; then
+      echo "[!] $(basename "$BIN") rejects the new settings of tunnel $N:" >&2
+      cfg_ok "$NEWCFG" 2>&1 | tail -5 >&2
+      log "new settings rejected by $(basename "$BIN"), not saved"; rc=1
+    else mv -f "$NEWCFG" "$CFG"; fi
+    rm -f "$NEWCFG"
   fi
+  # settings of the other kind, from before a change of kind
+  rm -f "$DIR/$N.$OTHER"
   # the running copy holds the key too: only root reads it
   [ -f "$RUNNING" ] && chmod 600 "$RUNNING"
   unfw old
   if [ "$ROLE" = iran ]; then
-    reserve; sync_chain; guard
+    reserve; sync_chain; guard; fw_in
     if [ -n "$ON" ]; then jump_on; else release; fi
-  else fw_foreign; fi
+  else fw_in; fi
+  fw6
   return $rc
 }
 down() {
-  local IFS=, lp
+  local IFS=, lp all u
   if [ "$ROLE" = iran ]; then
     release
     iptables -w -t nat -F "$CHAIN" 2>/dev/null; iptables -w -t nat -X "$CHAIN" 2>/dev/null
     # UDP users keep their redirect while they send, even with nothing listening
     # any more; without it their next packet goes to GRE
     if command -v conntrack >/dev/null; then
-      for lp in $(lport_list); do conntrack -D -p udp --reply-port-src "$lp" >/dev/null 2>&1; done; fi
+      all=$(lport_list); u=$(ublock) && all+=",$(seq "${u%:*}" "${u#*:}" | paste -sd, -)"
+      for lp in $all; do conntrack -D -p udp --reply-port-src "$lp" >/dev/null 2>&1; done; fi
     unreserve
   fi
-  unfw
-  rm -f "$STATE" "$RUNNING"; true
+  unfw; fw6 all
+  rm -f "$STATE" "$STATE.miss" "$FWRUN" "/run/xray-tunnel.$N.conf" "/run/xray-tunnel.$N.json" "/run/xray-tunnel.$N.toml"; true
 }
 
 # Iran: a SOCKS greeting to the foreign server's health listener, sent through
-# the tunnel, must come back as 05 00
+# the tunnel, must come back as 05 00 (reverse: asks for a password, 05 02)
+# Iran, reverse: listeners of frps running as root. ss shows the uid of other users'
+# sockets: their program could take a local port while frps has it closed
+frps_socks() { ss -Hlnpe "$@" 2>/dev/null | grep '"frps"' | grep -v ' uid:'; }
 probe() { local r
+  if [ "$MODE" = reverse ]; then
+    # the health port must be frps (not another program that took the port)
+    frps_socks -t "( sport = :$LHPORT )" | grep -q . || return 1
+    r=$(timeout 5 bash -c "exec 3<>/dev/tcp/127.0.0.1/$LHPORT || exit 1; printf 'GET / HTTP/1.0\r\n\r\n' >&3; head -c 5 <&3" 2>/dev/null)
+    [ "$r" = HTTP/ ]; return; fi
   r=$(timeout 5 bash -c "exec 3<>/dev/tcp/127.0.0.1/$LHPORT || exit 1; printf '\x05\x01\x00' >&3; head -c 2 <&3 | od -An -tx1" 2>/dev/null | tr -d ' \n')
   [ "$r" = 0500 ]; }
+
+# are the local listeners of user port $1 there (reverse: frps opens them only while
+# the foreign server sends that port, TCP and every UDP port of its block)
+port_ok() { local u want
+  [ "$MODE" = reverse ] || { ss -Hltn "( sport = :$(lport "$1") )" 2>/dev/null | grep -q .; return; }
+  # frps itself, not another program that took the port while the foreign server was away
+  frps_socks -t "( sport = :$(lport "$1") )" | grep -q . || return 1
+  u=$(urange "$1") || u="$(lport "$1")-$(lport "$1")"
+  want=$(( ${u#*-} - ${u%-*} + 1 ))
+  [ "$(frps_socks -u "( sport ge :${u%-*} and sport le :${u#*-} )" | wc -l)" -ge "$want" ]; }
+# ports of ON whose listeners are missing
+missing() { local IFS=, p out=""
+  for p in $ON; do port_ok "$p" || out+="${out:+,}$p"; done; echo "$out"; }
+# foreign, reverse: connections to the Iran server (the control connection, the pool
+# and the users' connections)
+rx_conns() { ss -Htn state established dst "$REMOTE_IP" "( dport = :$TPORT )" 2>/dev/null | wc -l; }
+# foreign, reverse: users' connections frpc has open to the services here (its idle pool
+# connections to Iran are not users)
+rx_users() { local IFS=, p f=""
+  for p in $PORTS; do f+="${f:+ or }dport = :$p"; done
+  [ -n "$f" ] || { echo 0; return; }
+  ss -Htn state established "( ( $f ) and dst $DEST )" 2>/dev/null | wc -l; }
+# foreign, reverse: the port of frpc's status page is free for it (frpc does not start
+# when its port is taken, so a port another program took is left out)
+aport_ok() { [ "$MODE" = reverse ] && [ "$ROLE" != iran ] && [[ $APORT =~ ^[0-9]+$ ]] || return 1
+  ! ss -Hltnp "( sport = :$APORT )" 2>/dev/null | grep -v '"frpc"' | grep -q .; }
+# foreign, reverse: is frpc logged in to the Iran server: its status page shows the
+# health proxy running. Users' connections that stay open after the login was lost
+# do not count
+rx_up() { local p w
+  p=$(sed -n 's/^webServer.port = //p' "$RUNNING" 2>/dev/null)
+  w=$(sed -n 's/^webServer.password = "\(.*\)"$/\1/p' "$RUNNING" 2>/dev/null)
+  if [[ $p =~ ^[0-9]+$ ]]; then
+    printf 'GET /api/status HTTP/1.0\r\nAuthorization: Basic %s\r\n\r\n' "$(printf 'health:%s' "$w" | base64 -w0)" |
+      timeout 5 bash -c "exec 3<>/dev/tcp/127.0.0.1/$p || exit 1; cat >&3; cat <&3" 2>/dev/null |
+      grep -o "\"name\":\"t$N-health\"[^}]*" | grep -q '"status":"running"'
+    return
+  fi
+  # a program started without the status page: the control connection alone is a
+  # login that did not finish
+  [ "$(rx_conns)" -ge 2 ]; }
 
 # Runs every 30 s: puts back rules that something removed (iptables -F, a GRE
 # tunnel restart that inserted its rules above ours) and logs when the tunnel
 # stops or starts answering. It never moves a port: only on/off does that.
-keep() { local st prev
+keep() { local st prev k miss c
   up >/dev/null 2>&1
-  [ "$ROLE" = iran ] || return 0
+  if [ "$ROLE" != iran ]; then
+    [ "$MODE" = reverse ] && systemctl -q is-active "xray-tunnel@$N" || return 0
+    # frpc has no time limit for the TLS handshake and login: when one hangs (a
+    # path that drops the connection after its first packets), it would wait many
+    # minutes. Not logged in for 90 s: restart it. Users' connections opened before
+    # can still work (a path that stops only new connections), and a restart cuts
+    # them, so while any is open it waits 10 minutes first
+    k=$(cat "$STATE" 2>/dev/null); [[ $k =~ ^[0-9]+$ ]] || k=0
+    if rx_up; then
+      [ "$k" -ge 3 ] && log "connected to the Iran server $REMOTE_IP:$TPORT again"
+      echo 0 > "$STATE"; return 0
+    fi
+    k=$((k + 1)); c=$(rx_users)
+    if [ "$k" = 3 ]; then
+      if [ "$c" -ge 1 ]; then
+        log "not logged in to the Iran server $REMOTE_IP:$TPORT for 90 s; $c users' connections opened before are still open, so it restarts only after 10 minutes (systemctl restart xray-tunnel@$N does it now and cuts them)"
+      else log "not connected to the Iran server $REMOTE_IP:$TPORT for 90 s: restarting it every 90 s until it connects"; fi
+    fi
+    if [ $((k % 3)) = 0 ] && { [ "$c" = 0 ] || [ "$k" -ge 20 ]; }; then
+      systemctl restart --no-block "xray-tunnel@$N" 9>&-   # (not holding our lock)
+    fi
+    echo "$k" > "$STATE"; return 0
+  fi
   prev=$(cat "$STATE" 2>/dev/null || echo ok)
   if ! systemctl -q is-active "xray-tunnel@$N"; then st=stopped
   elif probe; then st=ok; else st=fail; fi
@@ -244,14 +512,25 @@ keep() { local st prev
     esac
   fi
   echo "$st" > "$STATE"
+  # reverse: one port can be missing while the tunnel answers (its local port was taken)
+  if [ "$st" = ok ] && [ "$MODE" = reverse ]; then
+    miss=$(missing)
+    if [ "$miss" != "$(cat "$STATE.miss" 2>/dev/null)" ]; then
+      if [ -n "$miss" ]; then log "the foreign server does not send ports $miss now: their users cannot connect (xray-tunnel check $N)"
+      else log "all ports on the tunnel work again"; fi
+      echo "$miss" > "$STATE.miss"
+    fi
+  fi
 }
 
-flush_udp() { conntrack -D -p udp --reply-port-src "$1" >/dev/null 2>&1; true; }
+flush_udp() { local IFS=$' \t\n' u
+  command -v conntrack >/dev/null || return 0
+  for u in $(uports "$1"); do conntrack -D -p udp --reply-port-src "$u" >/dev/null 2>&1; done; true; }
 # ports already moved back to GRE by hand: UDP users who still send to the dead
 # tunnel (their redirect stays while they send) go to GRE once it is dead for 30 s
-unstick() { local IFS=, m
+unstick() { local IFS=, p
   command -v conntrack >/dev/null || return 0
-  for m in $LPORTS; do in_list "${m%%=*}" "$ON" || flush_udp "${m#*=}"; done; }
+  for p in $PORTS; do in_list "$p" "$ON" || flush_udp "$p"; done; }
 
 set_on() { local IFS=, p out=""
   for p in $ON; do [ "$p" = "$ARG" ] || out+="${out:+,}$p"; done
@@ -261,49 +540,99 @@ set_on() { local IFS=, p out=""
   sync_chain
   if [ -n "$ON" ]; then jump_on; else release; fi; }
 
-check() { local st c
-  echo "xray-tunnel $VERSION | tunnel $N | role $ROLE | peer $REMOTE_IP:$TPORT | ports $PORTS${ON:+ | on the tunnel: $ON}"
+check() { local st c miss
+  if [ "$MODE" = reverse ] && [ "$ROLE" = iran ]; then
+    echo "xray-tunnel $VERSION | tunnel $N | role iran | reverse: $REMOTE_IP connects to port $TPORT here | ports $PORTS${ON:+ | on the tunnel: $ON}"
+  elif [ "$MODE" = reverse ]; then echo "xray-tunnel $VERSION | tunnel $N | role foreign | reverse: connects to $REMOTE_IP:$TPORT | ports $PORTS"
+  else echo "xray-tunnel $VERSION | tunnel $N | role $ROLE | peer $REMOTE_IP:$TPORT | ports $PORTS${ON:+ | on the tunnel: $ON}"; fi
   if systemctl -q is-active "xray-tunnel@$N"; then echo "[ok] service xray-tunnel@$N is running"
   else echo "[!!] service xray-tunnel@$N is not running: journalctl -u xray-tunnel@$N -n 20"; fi
-  if [ -f "$RUNNING" ] && [ "$(cat "$RUNNING")" != "$(cat "$JSON" 2>/dev/null)" ]; then
-    echo "[i] new settings are saved but used only after: systemctl restart xray-tunnel@$N (cuts open tunnel connections)"; fi
+  if [ -f "$RUNNING" ] && [ "$(cat "$RUNNING")" != "$(cat "$CFG" 2>/dev/null)" ]; then
+    echo "[i] new settings are saved but used only after: systemctl restart xray-tunnel@$N (cuts open tunnel connections)"
+  elif [ ! -f "$RUNNING" ] && [ -f "/run/xray-tunnel.$N.$OTHER" ] && systemctl -q is-active "xray-tunnel@$N"; then
+    echo "[!!] the service still runs the $([ "$MODE" = reverse ] && echo forward || echo reverse) kind of this tunnel; the new kind"
+    echo "     starts with: systemctl restart xray-tunnel@$N (cuts open tunnel connections)"; fi
   if [ "$ROLE" = iran ]; then
-    c=$(ss -Htn state established dst "$REMOTE_IP" "( dport = :$TPORT )" 2>/dev/null | wc -l)
+    if [ "$MODE" = reverse ]; then c=$(ss -Htn state established src ":$TPORT" dst "$REMOTE_IP" 2>/dev/null | wc -l)
+    else c=$(ss -Htn state established dst "$REMOTE_IP" "( dport = :$TPORT )" 2>/dev/null | wc -l); fi
     if probe; then echo "[ok] the foreign server answers through the tunnel ($c open tunnel connections)"; st=0
+    elif [ "$MODE" = reverse ]; then
+      echo "[!!] no answer through the tunnel: $REMOTE_IP is not connected to port $TPORT here ($c connections)"
+      echo "     (run 'xray-tunnel check $N' on $REMOTE_IP; if its IP changed, run option 1 here with the new IP)"; st=1
     else echo "[!!] no answer through the tunnel (run 'xray-tunnel check $N' on $REMOTE_IP too)"; st=1; fi
     if [ -z "$ON" ]; then echo "[i] no port uses the tunnel yet (move one: xray-tunnel on $N PORT)"
     elif jump_first; then
       echo "[ok] ports $ON use the tunnel (new connections)"
     else echo "[!!] ports $ON should use the tunnel but its rule is not first (fixed within 30 s, or run: xray-tunnel up $N)"; fi
+    if [ "$st" = 0 ] && [ "$MODE" = reverse ]; then
+      miss=$(missing)
+      [ -z "$miss" ] || { echo "[!!] the foreign server does not send ports $miss now: their users cannot connect"
+        echo "     (run option 1 on $REMOTE_IP with the latest code; journalctl -u xray-tunnel@$N -n 20 here)"; st=1; }
+    fi
     return $st
+  fi
+  if [ "$MODE" = reverse ]; then
+    c=$(rx_conns)
+    if rx_up; then echo "[ok] connected to the Iran server $REMOTE_IP:$TPORT ($c connections)"; return 0; fi
+    echo "[!!] not connected to the Iran server $REMOTE_IP:$TPORT (journalctl -u xray-tunnel@$N -n 20)."
+    echo "     If this server's IP changed, run option 1 on the Iran server with the new IP."
+    return 1
   fi
   c=$(ss -Htn state established src ":$TPORT" dst "$REMOTE_IP" 2>/dev/null | wc -l)
   if ss -Hltn "( sport = :$TPORT )" 2>/dev/null | grep -q .; then echo "[ok] listening on port $TPORT ($c connections from $REMOTE_IP)"
   else echo "[!!] nothing listens on port $TPORT"; return 1; fi
 }
 
+# the installer is changing the settings of this tunnel and may still ask before they
+# apply: the timers do not apply them meanwhile (a marker older than 15 minutes is left over)
+busy() { [ -z "${XT_INSTALLER:-}" ] && [ -n "$(find "/run/xray-tunnel.$N.busy" -mmin -15 2>/dev/null)" ]; }
 case "$CMD" in
-  up) up ;; down) down ;; keep) keep ;;
-  # the service starts xray with the settings on disk now
-  prestart) up; [ -f "$JSON" ] && install -m 600 "$JSON" "$RUNNING" ;;
+  up) busy || up ;; down) down ;; keep) busy || keep ;;
+  # the service starts the program with the settings on disk now
+  prestart) up; rm -f "/run/xray-tunnel.$N.$OTHER"
+    # the files of the other kind are not used any more (they were kept until now for
+    # the program that ran before)
+    if [ "$MODE" = reverse ] && [ "$ROLE" != iran ]; then rm -f "$DIR/$N.crt" "$DIR/$N.key"; mkdir -p "$LIB/empty"
+    elif [ "$MODE" = reverse ]; then :
+    elif [ "$ROLE" = iran ]; then rm -f "$DIR/$N.crt" "$DIR/$N.key"
+    else rm -f "$DIR/$N.ca.crt"; fi
+    [ -f "$CFG" ] && install -m 600 "$CFG" "$RUNNING"
+    # foreign, reverse: the count of keep checks without a login starts again
+    [ "$MODE" = reverse ] && [ "$ROLE" != iran ] && echo 0 > "$STATE"
+    echo "$MODE $TPORT $REMOTE_IP" > "$FWRUN"
+    # the installer counts the users of the running program with these settings
+    install -m 600 "$CONF" "/run/xray-tunnel.$N.conf"
+    # the filter of the settings the program ran with before is not needed any more
+    up >/dev/null 2>&1 ;;
+  run) if [ "$MODE" = reverse ]; then exec "$BIN" -c "$CFG"; else exec "$BIN" run -c "$CFG"; fi ;;
+  # is the program running with the settings on disk
+  current) is_current ;;
   check) check ;;
   on|off)
     [ "$ROLE" = iran ] || { echo "run this on the Iran server"; exit 1; }
     [[ $ARG =~ ^[0-9]+$ ]] && in_list "$ARG" "$PORTS" || { echo "port '$ARG' is not one of this tunnel's ports ($PORTS)"; exit 1; }
     if [ "$CMD" = on ]; then
       probe || { echo "[!!] the tunnel does not answer (xray-tunnel check $N); port $ARG stays on GRE"; exit 1; }
-      ss -Hltn "( sport = :$(lport "$ARG") )" 2>/dev/null | grep -q . || {
-        echo "[!!] xray does not listen for port $ARG yet: it needs systemctl restart xray-tunnel@$N (cuts open tunnel connections); port $ARG stays on GRE"; exit 1; }
+      port_ok "$ARG" || {
+        if [ "$MODE" = reverse ]; then echo "[!!] the foreign server does not send port $ARG yet: run option 1 there with the latest code; port $ARG stays on GRE"
+        else echo "[!!] xray does not listen for port $ARG yet: it needs systemctl restart xray-tunnel@$N (cuts open tunnel connections); port $ARG stays on GRE"; fi
+        exit 1; }
       set_on add; log "port $ARG moved to the tunnel"
       echo "port $ARG: new connections use the encrypted tunnel; open ones stay on GRE until they end"
+      # UDP users keep their GRE path while they send: on a GRE tunnel that does not
+      # answer they would stay cut, so they are moved now
+      if command -v conntrack >/dev/null && [ -f "/etc/gre-tunnel/$N.conf" ] &&
+         ! timeout 20 /usr/local/sbin/gre-tunnel check "$N" >/dev/null 2>&1; then
+        conntrack -D -p udp --orig-port-dst "$ARG" --reply-src "10.200.$N.1" >/dev/null 2>&1
+        echo "GRE tunnel $N does not answer: UDP users of port $ARG were moved to the encrypted tunnel too"; fi
     else set_on del; log "port $ARG moved back to GRE"
       echo "port $ARG: new connections use GRE again; open tunnel connections continue until they end"
       # UDP users keep their redirect while they send. When the tunnel is dead (the
       # 30 s check found it dead and it still does not answer) they would stay cut,
       # so they are moved to GRE now; on a working tunnel they stay, like TCP users
       if command -v conntrack >/dev/null && [ "$(cat "$STATE" 2>/dev/null || echo ok)" != ok ] && ! probe; then
-        flush_udp "$(lport "$ARG")"
+        flush_udp "$ARG"
         echo "the tunnel does not answer: UDP users of port $ARG were moved to GRE too"; fi
     fi ;;
-  *) echo "usage: xray-tunnel check|on|off|up|down|keep <N> [port] | version"; exit 1 ;;
+  *) echo "usage: xray-tunnel check|on|off|up|down|keep|run <N> [port] | version"; exit 1 ;;
 esac

@@ -2,7 +2,7 @@
 # GRE tunnel runtime. Usage: gre-tunnel up|down|check|diag|watchdog <N>
 # Settings for tunnel N live in /etc/gre-tunnel/<N>.conf
 set -u
-VERSION=4.0.0
+VERSION=4.1.0
 CMD=${1:-}; N=${2:-}
 if [ "$CMD" = version ]; then echo "gre-tunnel $VERSION"; exit 0; fi
 CONF=/etc/gre-tunnel/$N.conf
